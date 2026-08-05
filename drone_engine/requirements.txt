@@ -1,0 +1,56 @@
+# ================================================================
+# Drone Engine — Full Requirements
+# Phases 1-6: Detection · Tracking · Re-ID · Voice Commands · Small-Object VLM
+# ================================================================
+
+# --- Core vision pipeline ---
+opencv-python
+numpy
+ultralytics          # YOLOv8n detection (auto-downloads yolov8n.pt on first run)
+
+# --- SmolVLM (shared model: re-ID + small-object classifier + command parser) ---
+transformers>=4.40   # AutoModelForImageTextToText added in 4.40
+torch                # CPU build by default; see Pi note below
+pillow
+
+# --- Drone controller ---
+pygame               # Sim2DDroneController (works today, no drone needed)
+mavsdk               # Only when connecting to PX4 SITL — safe to omit until then
+
+# --- Voice command interface ---
+SpeechRecognition    # Mic input (Google Web Speech backend)
+pyaudio              # Microphone hardware layer for SpeechRecognition
+pyttsx3              # TTS confirmation feedback
+
+# --- Offline voice (Pi deployment — swap in place of SpeechRecognition+pyaudio) ---
+# vosk               # Offline STT — download model from https://alphacephei.com/vosk/models
+# sounddevice        # Audio I/O for vosk
+
+# --- System monitoring ---
+psutil               # CPU / RAM watchdog
+
+# ================================================================
+# Raspberry Pi notes
+# ================================================================
+# Install:
+#   pip install -r requirements.txt --break-system-packages
+#
+# torch on ARM (Pi 4/5):
+#   The default pip wheel may not exist for your ARM build.
+#   Use piwheels or the official PyTorch ARM page:
+#     https://pytorch.org/get-started/locally/
+#   Or install from piwheels:
+#     pip install torch --index-url https://www.piwheels.org/simple
+#
+# SmolVLM-256M-Instruct downloads ~987 MB from HuggingFace on first run.
+#   Requires a 32 GB+ SD card (an 8 GB card won't fit OS + packages + model).
+#
+# pyaudio on Pi:
+#   sudo apt-get install portaudio19-dev python3-pyaudio
+#   pip install pyaudio
+#
+# Vosk offline model (if using offline voice backend):
+#   wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+#   unzip vosk-model-small-en-us-0.15.zip
+#   (place folder next to voice_command_interface.py)
+# ================================================================
