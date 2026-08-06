@@ -147,6 +147,21 @@ def _extract_reid_tag(raw_text: str) -> str:
     return raw_text.strip().lower()
 
 
+class VLMThreadLimiter:
+    """Temporarily constrains PyTorch intra-op threads to target_threads during VLM generate()."""
+    def __init__(self, target_threads: int = 1):
+        self.target_threads = target_threads
+        self.prev_threads = 1
+
+    def __enter__(self):
+        self.prev_threads = torch.get_num_threads()
+        torch.set_num_threads(self.target_threads)
+        return self
+
+    def __exit__(self, *args):
+        torch.set_num_threads(self.prev_threads)
+
+
 class ReIDEngine:
     def __init__(self, model_id=MODEL_ID, shared_model=None, shared_processor=None,
                  shared_inference_lock=None):
@@ -277,11 +292,14 @@ class ReIDEngine:
         # H2 fix: shared lock ensures classify() and generate_hud_label() never overlap
         with self._inference_lock:
             with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=15,
-                    do_sample=False,
-                )
+                with VLMThreadLimiter(1):
+                    threads_in_hud = torch.get_num_threads()
+                    print(f"[DIAG 1b] VLM generate_hud_label scoped to torch threads={threads_in_hud}")
+                    generated_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=15,
+                        do_sample=False,
+                    )
 
         dt = time.perf_counter() - _t0
         print(f"[HUD_LABEL] call #{call_n} done   dt={dt:.2f}s")

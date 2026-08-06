@@ -82,21 +82,27 @@ class SmolObjectClassifier:
         model_id: str = SMOLVLM_MODEL_ID,
         shared_inference_lock=None,          # H1/H2 fix: shared VLM serialisation lock
     ):
-        self._lock = threading.Lock()        # internal guard (kept for compat)
+        """
+        Parameters
+        ----------
+        model_id              : HuggingFace model ID to load (if not using shared instance)
+        shared_model          : pre-loaded AutoVLMModel — pass this to skip a second model load
+        shared_processor      : pre-loaded AutoProcessor — must be provided with shared_model
+        shared_inference_lock : threading.Lock shared with ReIDEngine to prevent
+                                concurrent model.generate() calls from cls_executor and
+                                reid_executor threads simultaneously. Without this, both
+                                callers run on the same model object at once -> starvation.
+        """
+        # H1+H2 fix: shared inference lock
         self._inference_lock = shared_inference_lock or threading.Lock()
-        self._last_classified: dict[int, float] = {}   # track_id -> timestamp
-
-        # --- Call-frequency logging (H1 diagnosis) ---
-        self._cls_call_count: int = 0
-        self._cls_last_submit_wall: float = 0.0   # wall time of previous classify() start
 
         if shared_model is not None and shared_processor is not None:
-            print("[SmolObjectClassifier] Using shared SmolVLM model instance.")
+            print("[SmolObjectClassifier] Using shared SmolVLM model instance (no second load).")
             self.model = shared_model
             self.processor = shared_processor
             self.device = next(shared_model.parameters()).device
         else:
-            print(f"[SmolObjectClassifier] Loading {model_id} independently ...")
+            print(f"[SmolObjectClassifier] Loading {model_id} ...")
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             self.processor = AutoProcessor.from_pretrained(model_id)
             self.model = AutoVLMModel.from_pretrained(
@@ -105,62 +111,55 @@ class SmolObjectClassifier:
             self.model.eval()
             print(f"[SmolObjectClassifier] Loaded on {self.device}.")
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        # Per-track cooldown tracking: {track_id: timestamp_float}
+        self._last_classified = {}
+        # H1 diagnosis: call counter
+        self._call_count = 0
+        self._last_wall = 0.0
 
     def classify(self, crop_bgr: np.ndarray) -> str:
         """
-        Run SmolVLM on *crop_bgr* (BGR numpy array) and return a short
-        description string. Thread-safe via shared_inference_lock.
-
-        H1 diagnosis: every call logs wall-time, duration, and gap from previous
-        so call frequency can be verified from the console.
+        Run SmolVLM on a single cropped image region.
+        Returns a short (<6 word) natural language description string.
         """
         if crop_bgr is None or crop_bgr.size == 0:
-            return "unknown"
-        h, w = crop_bgr.shape[:2]
-        if h < MIN_CROP_DIM or w < MIN_CROP_DIM:
             return "too small to classify"
 
-        import cv2  # local import — not always needed at module level
+        h, w = crop_bgr.shape[:2]
+        if min(h, w) < MIN_CROP_DIM:
+            return "too small to classify"
+
+        # H1 diagnosis: log every call so frequency is visible in console
+        self._call_count += 1
+        call_n = self._call_count
+        now_wall = time.time()
+        gap = now_wall - self._last_wall if self._last_wall > 0 else -1.0
+        self._last_wall = now_wall
+        if gap >= 0:
+            print(f"[CLASSIFY] call #{call_n} start  wall={now_wall:.3f}  gap_from_prev={gap:.2f}s")
+        else:
+            print(f"[CLASSIFY] call #{call_n} start  wall={now_wall:.3f}  (first call)")
+        _t0 = time.perf_counter()
+
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": CLASSIFY_PROMPT},
-                ],
-            }
-        ]
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": CLASSIFY_PROMPT}]}]
         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
         inputs = self.processor(text=prompt, images=[image], return_tensors="pt").to(self.device)
 
-        # H1 diagnosis: log call number, wall time, gap from previous call
-        self._cls_call_count += 1
-        call_n = self._cls_call_count
-        now_wall = time.time()
-        gap = now_wall - self._cls_last_submit_wall if self._cls_last_submit_wall > 0 else -1.0
-        self._cls_last_submit_wall = now_wall
-        print(f"[CLASSIFY] call #{call_n} start  wall={now_wall:.3f}  "
-              f"gap_from_prev={gap:.2f}s" if gap >= 0 else
-              f"[CLASSIFY] call #{call_n} start  wall={now_wall:.3f}  (first call)")
-        _t0 = time.perf_counter()
-
-        # H1+H2 fix: shared inference lock prevents concurrent model.generate() calls
-        # between classify() (cls_executor thread) and generate_hud_label() (reid_executor thread).
-        # Without this lock, both threads call model.generate() simultaneously on the same object
-        # -> torch intraop threads (capped to 2) split between them -> YOLO also starved -> main-loop lag.
+        # H1+H2 fix + Test 1b: VLMThreadLimiter constrains VLM generate() to 1 thread on CPU
+        # so YOLO and main loop keep full CPU thread budget.
         with self._inference_lock:
             with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=12,        # Phase B: was 20; 6-word desc fits in 12 tokens
-                    do_sample=False,          # greedy — faster, more consistent labels
-                )
+                with VLMThreadLimiter(1):
+                    threads_in_vlm = torch.get_num_threads()
+                    print(f"[DIAG 1b] VLM classify generate() running with scoped torch threads={threads_in_vlm}")
+                    generated_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=12,        # Phase B: was 20; 6-word desc fits in 12 tokens
+                        do_sample=False,          # greedy — faster, more consistent labels
+                    )
 
         dt = time.perf_counter() - _t0
         print(f"[CLASSIFY] call #{call_n} done   dt={dt:.2f}s")

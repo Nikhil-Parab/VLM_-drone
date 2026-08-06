@@ -1,18 +1,36 @@
 """
 drone_tracking_engine.py
 ==========================
-Full pipeline — Phase 1-6 integrated + Optimization Phases A/B/D/G/I:
+Full pipeline — Phase 1-6 integrated + Optimization Phases A/B/C/D/G/I
++ Pi5 hard 2-thread/2-core budget + scoped VLM thread-priority fix.
 
   Phase A: Two dedicated ThreadPoolExecutors (cls + reid) so classification
            and ReID run concurrently. VLM timeout watchdog abandons stuck calls.
-  Phase B: torch.set_num_threads(2) at startup.
+  Phase B: torch.set_num_threads(2) at startup (process-wide ceiling).
+  Phase C: ORB+histogram embedding ReID (fast, ~5ms) — VLM only used for the
+           optional HUD label, never for frame-to-frame ReID decisions.
   Phase D: YOLO ROI crop (run detection only around Kalman-predicted position
-           when locked) + frame-skip when locked (DETECT_EVERY_N_FRAMES_LOCKED).
+           when locked) + frame-skip when locked (DETECT_EVERY_N_FRAMES_LOCKED)
+           + two-tier confidence threshold + optional SAHI-style tiled search
+           + BWCD-NMS postprocessing for dense/small-object scenes.
   Phase G: pick_best_candidate() uses combined distance+IoU score to reduce
            identity switches when targets cross paths.
   Phase I: PerfTimer per-stage instrumentation; [p] key toggles HUD timing.
 
-  camera → YOLOv8n detection (full frame or ROI crop)
+  NEW — Pi5 thread-budget fixes:
+    * A single, unambiguous source of truth for the process's thread/core
+      ceiling (was previously set in two places that could silently
+      disagree — see apply_cpu_affinity()/set_thread_budget() below).
+    * VLM generate() calls (in reid_engine.py / small_object_classifier.py)
+      now run at a temporarily-reduced thread count so they can never starve
+      the main loop's share of the fixed 2-thread budget — see
+      _low_priority_inference() in those two files.
+    * Periodic console confirmation that the process is still actually
+      pinned to its intended cores/threads (drift/verification logging),
+      since individual libraries don't always respect a soft hint equally.
+
+  camera → YOLOv8n detection (full frame / ROI crop / tiled search)
+         → BWCD-NMS postprocessing
          → SmolObjectClassifier  (small / uncertain boxes get VLM labels)
          → Kalman tracker  (predict / update every frame)
          → periodic embedding-based re-ID check  (every 0.5s, ~5ms per check)
@@ -32,6 +50,8 @@ Controls (keyboard):
 pip install: ultralytics opencv-python transformers torch pillow pygame numpy
 Run:
     python drone_tracking_engine.py
+    python drone_tracking_engine.py --max-cores 2      # Pi5 production budget
+    python drone_tracking_engine.py --max-cores 4       # dev laptop, no cap
 """
 
 import argparse
@@ -40,6 +60,7 @@ import concurrent.futures
 import csv
 import io
 import json
+import os
 import queue
 import socket
 import threading
@@ -55,17 +76,88 @@ from kalman_tracker import KalmanTrack
 from reid_engine import ReIDEngine
 from small_object_classifier import SmolObjectClassifier
 
-# Phase B: cap intra-op threads before any torch model work
-# Override at runtime with:  python drone_tracking_engine.py --threads N
-torch.set_num_threads(2)
+# ============================================================
+# HARD THREAD/CORE BUDGET — single source of truth
+# ============================================================
+# Everything else in this file and in reid_engine.py / small_object_classifier.py
+# assumes this value is set ONCE, here, before any torch/model work happens,
+# and never silently overridden elsewhere. The previous version of this file
+# set torch.set_num_threads(2) at import time AND ALSO let select_camera()'s
+# --threads CLI flag override it later (with a broken log message that always
+# printed the same value twice) -- that made it possible for the effective
+# thread count to end up higher than the OS-level core affinity pin, which is
+# worse than either limit alone (oversubscription: more threads than cores
+# means the OS scheduler thrashes between them instead of running cleanly).
+# This version fixes that: --max-cores is now the ONE flag that controls both
+# torch's intra-op thread count and the OS affinity pin together, and they are
+# always kept equal.
+
+DEFAULT_MAX_CORES = 2  # <-- Pi5 production budget; override with --max-cores N
+
+
+def set_thread_budget(max_cores: int):
+    """
+    Set BOTH torch's intra-op thread count and the OS-level CPU affinity to
+    the same value, so the process can never oversubscribe (more torch
+    threads than pinned cores) or undersubscribe in a way that leaves torch
+    threads waiting on cores the OS won't schedule them onto.
+    """
+    torch.set_num_threads(max_cores)
+
+    if hasattr(os, "sched_setaffinity"):
+        try:
+            target_cores = set(range(max_cores))
+            os.sched_setaffinity(0, target_cores)
+        except Exception as exc:
+            print(f"[BUDGET] Could not set os.sched_setaffinity: {exc}")
+    else:
+        print(f"[BUDGET] os.sched_setaffinity not supported on {os.name} "
+              f"(fine on Windows/dev machines; required on the Pi5 target).")
+
+    verify_thread_budget(max_cores, context="startup")
+
+
+def verify_thread_budget(expected_cores: int, context: str = ""):
+    """
+    Read back the ACTUAL current thread count / affinity and log it, rather
+    than trusting that the earlier set_thread_budget() call stuck. Some
+    libraries (OpenCV's own internal thread pool in particular) have their
+    own separate thread settings that are not touched by torch.set_num_threads()
+    or os.sched_setaffinity() alone -- this makes any mismatch visible in the
+    console instead of silently causing contention.
+    """
+    actual_torch_threads = torch.get_num_threads()
+    if hasattr(os, "sched_getaffinity"):
+        actual_affinity = os.sched_getaffinity(0)
+    else:
+        actual_affinity = "n/a (platform doesn't support sched_getaffinity)"
+
+    try:
+        cv2_threads = cv2.getNumThreads()
+    except Exception:
+        cv2_threads = "unknown"
+
+    ok = (actual_torch_threads == expected_cores)
+    tag = "OK" if ok else "MISMATCH"
+    print(f"[BUDGET:{context}] torch_threads={actual_torch_threads} "
+          f"affinity={actual_affinity} cv2_threads={cv2_threads} "
+          f"expected={expected_cores} [{tag}]")
+    if cv2_threads != "unknown" and cv2_threads > expected_cores:
+        print(f"[BUDGET:{context}] WARNING: OpenCV's own thread pool "
+              f"({cv2_threads}) exceeds the intended budget ({expected_cores}). "
+              f"Consider calling cv2.setNumThreads({expected_cores}) explicitly.")
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-YOLO_MODEL_PATH          = "../yolov8n.pt"   # <-- CHANGE DETECTOR MODEL
-TARGET_CLASS_NAME        = "person"          # <-- CHANGE TARGET CLASS (COCO label)
-DETECTION_CONFIDENCE     = 0.4              # <-- CHANGE detection threshold
+YOLO_MODEL_PATH             = "../yolov8n.pt"   # <-- CHANGE DETECTOR MODEL
+TARGET_CLASS_NAME           = "person"          # <-- CHANGE TARGET CLASS (COCO label)
+DETECTION_CONFIDENCE_LOCKED = 0.40              # <-- locked-mode detection threshold
+DETECTION_CONFIDENCE_SEARCH = 0.25              # <-- two-tier threshold for small objects when unlocked
+YOLO_IMGSZ                  = 640               # <-- inference resolution (640, 960, or 1280)
+ENABLE_TILED_SEARCH         = False             # <-- SAHI-style 2x2 grid search; costs more CPU, gate carefully under 2-core budget
 
 CAMERA_INDEX             = 0
 FRAME_WIDTH              = 640
@@ -80,7 +172,7 @@ DETECT_EVERY_N_FRAMES_LOCKED  = 3   # <-- ROI detection rate (locked+stable)
 ROI_PAD_PX                    = 120  # <-- padding around Kalman prediction for ROI crop
 
 # Phase A: VLM watchdog — abandon future if it runs longer than this
-VLM_TIMEOUT_SEC = 25.0  # <-- ~2.5× observed mean SmolVLM latency
+VLM_TIMEOUT_SEC = 25.0  # <-- ~2.5x observed mean SmolVLM latency
 
 # Phase G: pick_best_candidate scoring weights
 DIST_WEIGHT = 0.6   # <-- contribution of distance score
@@ -106,10 +198,9 @@ class PerfTimer:
 
     def __init__(self, name: str):
         self.name = name
-        # Use deque so background-thread timers can append safely with GIL protection
         self._samples: collections.deque = collections.deque(maxlen=self.WINDOW)
         self._t0: float = 0.0
-        self._lock = threading.Lock()  # only needed for cross-thread timers
+        self._lock = threading.Lock()
 
     def start(self):
         self._t0 = time.perf_counter()
@@ -119,12 +210,11 @@ class PerfTimer:
         self._samples.append(dt_ms)
 
     def record(self, dt_ms: float):
-        """Record a pre-computed duration (used from background threads)."""
         with self._lock:
             self._samples.append(dt_ms)
 
     def avg_ms(self) -> float:
-        s = list(self._samples)  # snapshot
+        s = list(self._samples)
         return sum(s) / len(s) if s else 0.0
 
     def __enter__(self):
@@ -136,28 +226,34 @@ class PerfTimer:
 
 
 # ============================================================
-# CAMERA SELECTION
+# CLI ARGS — parsed once, up front, before any camera/device/thread setup
 # ============================================================
 
-def select_camera():
-    """
-    Prompt user or parse CLI args to select camera source:
-      - Laptop / built-in webcam (index 0 or integer)
-      - IP Webcam URL (e.g. http://192.168.0.253:8080/video)
-    """
+def parse_args():
     parser = argparse.ArgumentParser(description="Drone Tracking Engine")
     parser.add_argument("--cam", "--camera", type=str, default=None,
                         help="Camera index (e.g. 0) or IP URL")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu", "auto"],
                         help="Device to use for models: cuda or cpu")
-    parser.add_argument("--threads", type=int, default=2,
-                        help="torch intra-op thread count (default 2; Step 3 test: try 4)")
+    parser.add_argument("--max-cores", type=int, default=DEFAULT_MAX_CORES,
+                        help=f"Hard ceiling on BOTH torch intra-op threads AND OS "
+                             f"CPU affinity, kept in sync (default {DEFAULT_MAX_CORES}; "
+                             f"set to your Pi5's reserved-core count in production, or "
+                             f"higher on a dev laptop with no reservation needed).")
     args, _ = parser.parse_known_args()
-    # Step 3: apply thread count BEFORE any torch work
-    torch.set_num_threads(args.threads)
-    print(f"[ENGINE] torch.set_num_threads({args.threads})  "
-          f"(was: {args.threads}, override with --threads N)")
+    return args
 
+
+# ============================================================
+# CAMERA SELECTION
+# ============================================================
+
+def select_camera(args):
+    """
+    Prompt user or parse CLI args to select camera source:
+      - Laptop / built-in webcam (index 0 or integer)
+      - IP Webcam URL (e.g. http://192.168.0.253:8080/video)
+    """
     cam_source = args.cam
     if cam_source is None:
         print("\n" + "=" * 54)
@@ -194,21 +290,15 @@ def select_camera():
     return cam_source
 
 
-def select_device() -> str:
-    """
-    Prompt user or parse CLI args to select computation device (CUDA GPU vs CPU).
-    """
-    parser = argparse.ArgumentParser(description="Drone Tracking Engine")
-    parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu", "auto"])
-    args, _ = parser.parse_known_args()
-
+def select_device(args) -> str:
+    """Prompt user or parse CLI args to select computation device (CUDA GPU vs CPU)."""
     chosen_device = args.device
     if chosen_device is None:
         print("\n" + "=" * 54)
         print(" SELECT COMPUTATION DEVICE")
         print("=" * 54)
-        print("  [1] CUDA GPU (NVIDIA RTX 3050 — fast)")
-        print("  [2] CPU (Host Processor — standard)")
+        print("  [1] CUDA GPU (fast, if available)")
+        print("  [2] CPU (Host Processor — standard, e.g. Pi5)")
         print("=" * 54)
         try:
             choice = input("Select device option (1 or 2, default 1): ").strip()
@@ -225,7 +315,7 @@ def select_device() -> str:
             print("\n" + "!" * 60)
             print("[WARNING] CUDA device requested, but torch.cuda.is_available() is False!")
             print("Current PyTorch build is CPU-only (torch+cpu).")
-            print("To enable NVIDIA RTX 3050 GPU acceleration, run this in your terminal:")
+            print("To enable GPU acceleration, install a CUDA-enabled torch build:")
             print("  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall")
             print("!" * 60 + "\n")
             print("[DEVICE] Falling back to CPU for this run.")
@@ -244,15 +334,8 @@ class ThreadedCameraStream:
     Background thread that continuously grabs frames from an IP camera / webcam stream.
     Eliminates network buffer queue lag by always serving the LATEST available frame
     and automatically resizing high-resolution phone streams (1080p/4K) to 640x480.
-
-    Step 1 instrumentation added:
-      - t_thread_internal : PerfTimer for each cap.read()+resize() in the background thread
-      - t_copy            : PerfTimer for the .copy() inside read() (main-thread side)
-      - backend_name      : cv2 backend string logged at startup
-      - Step 4: CAP_PROP_BUFFERSIZE read-back + backend name validated at init
     """
-    # Shared timer for camera_thread_internal — written from bg thread, read from main
-    t_thread_internal: "PerfTimer" = None  # set after PerfTimer is defined; see __init__
+    t_thread_internal: "PerfTimer" = None
 
     def __init__(self, src, target_size=(FRAME_WIDTH, FRAME_HEIGHT)):
         self.src = src
@@ -263,7 +346,6 @@ class ThreadedCameraStream:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_size[0])
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_size[1])
 
-        # Step 4: attempt to set buffer to 1; read back to check if honored
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         actual_buf = self.cap.get(cv2.CAP_PROP_BUFFERSIZE)
         try:
@@ -281,12 +363,9 @@ class ThreadedCameraStream:
         self.stopped = False
         self.lock = threading.Lock()
 
-        # Step 1: per-iteration timing for the background capture thread
         self.t_thread_internal = PerfTimer("cam_thread")
-        # Step 1: frame timestamp tracking for Step 4 backlog detection
         self._last_bg_wall: float = 0.0
         self._frame_wall_gaps: collections.deque = collections.deque(maxlen=60)
-        # Step 1: copy timer (written from main thread, so no cross-thread concern)
         self.t_copy = PerfTimer("cam_copy")
 
         if self.cap.isOpened():
@@ -300,13 +379,11 @@ class ThreadedCameraStream:
             self.thread.start()
 
     def _update_loop(self):
-        """Background capture thread — Step 1: each iteration is timed."""
         while not self.stopped:
             if not self.cap.isOpened():
                 time.sleep(0.01)
                 continue
 
-            # Step 1: time the actual cap.read() + optional resize
             _t0 = time.perf_counter()
             grabbed, frame = self.cap.read()
             if grabbed and frame is not None and frame.size > 0:
@@ -315,7 +392,6 @@ class ThreadedCameraStream:
                 _dt_ms = (time.perf_counter() - _t0) * 1000.0
                 self.t_thread_internal.record(_dt_ms)
 
-                # Step 4: track wall-clock gaps to detect buffer backlog
                 now_wall = time.time()
                 if self._last_bg_wall > 0:
                     self._frame_wall_gaps.append(now_wall - self._last_bg_wall)
@@ -328,19 +404,16 @@ class ThreadedCameraStream:
                 time.sleep(0.01)
 
     def read(self):
-        """Main-thread read — Step 1: .copy() time measured separately."""
         with self.lock:
             if self.latest_frame is None:
                 return False, None
             grabbed = self.grabbed
-            # Step 1: isolate the copy cost
             _t0 = time.perf_counter()
             frame = self.latest_frame.copy()
             self.t_copy.record((time.perf_counter() - _t0) * 1000.0)
         return grabbed, frame
 
     def get_bg_gap_stats(self):
-        """Step 4: returns (mean_gap_ms, max_gap_ms) of background thread frame intervals."""
         gaps = list(self._frame_wall_gaps)
         if not gaps:
             return 0.0, 0.0
@@ -356,15 +429,100 @@ class ThreadedCameraStream:
 
 
 # ============================================================
-# HELPERS
+# HELPERS & POST-PROCESSING
 # ============================================================
 
-def detect_target_candidates(yolo_model, frame, target_class_name, conf_threshold, device="cpu"):
+def bwcd_nms(candidates: list, iou_thresh: float = 0.45, diou_gamma: float = 0.2, sigma: float = 0.5) -> list:
     """
-    Run YOLOv8n on the full frame.
+    Batch-mode Weighted-Cluster DIoU-NMS (BWCD-NMS).
+    Replaces hard box suppression with DIoU-penalized cluster distance matching
+    and score-weighted coordinate merging for dense/small-object scenes.
+    O(n^2) over candidates -- negligible cost at the small candidate counts
+    (typically < 20) this pipeline produces per frame; if candidate counts ever
+    grow much larger (e.g. very dense tiled-search results), consider a
+    spatial index (grid buckets) before this becomes a bottleneck.
+    """
+    if not candidates or len(candidates) <= 1:
+        return candidates
+
+    candidates_sorted = sorted(candidates, key=lambda c: c["conf"], reverse=True)
+    merged_candidates = []
+
+    active_indices = list(range(len(candidates_sorted)))
+
+    while active_indices:
+        best_idx = active_indices.pop(0)
+        best_c = candidates_sorted[best_idx]
+        bx1, by1, bx2, by2 = best_c["bbox"]
+        b_cx, b_cy = best_c["center"]
+
+        cluster_indices = [best_idx]
+        remaining_indices = []
+
+        for idx in active_indices:
+            cand = candidates_sorted[idx]
+            cx1, cy1, cx2, cy2 = cand["bbox"]
+            c_cx, c_cy = cand["center"]
+
+            ix1, iy1 = max(bx1, cx1), max(by1, cy1)
+            ix2, iy2 = min(bx2, cx2), min(by2, cy2)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            area_c = max(0.0, cx2 - cx1) * max(0.0, cy2 - cy1)
+            union = area_b + area_c - inter
+            iou = inter / max(union, 1e-7)
+
+            enc_x1, enc_y1 = min(bx1, cx1), min(by1, cy1)
+            enc_x2, enc_y2 = max(bx2, cx2), max(by2, cy2)
+            c2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2
+
+            rho2 = (b_cx - c_cx) ** 2 + (b_cy - c_cy) ** 2
+            r_diou = rho2 / max(c2, 1e-7)
+
+            diou_score = iou - diou_gamma * r_diou
+
+            if diou_score >= iou_thresh:
+                cluster_indices.append(idx)
+            else:
+                remaining_indices.append(idx)
+
+        active_indices = remaining_indices
+
+        if len(cluster_indices) == 1:
+            merged_candidates.append(best_c)
+        else:
+            weights = []
+            boxes = []
+            for c_idx in cluster_indices:
+                cand = candidates_sorted[c_idx]
+                cx1, cy1, cx2, cy2 = cand["bbox"]
+                c_cx, c_cy = cand["center"]
+                rho2 = (b_cx - c_cx) ** 2 + (b_cy - c_cy) ** 2
+                w = cand["conf"] * np.exp(-rho2 / (sigma * 100.0 + 1e-7))
+                weights.append(w)
+                boxes.append([cx1, cy1, cx2, cy2])
+
+            weights = np.array(weights, dtype=np.float32)
+            weights /= max(np.sum(weights), 1e-7)
+
+            weighted_box = np.sum(np.array(boxes, dtype=np.float32) * weights[:, None], axis=0)
+            wx1, wy1, wx2, wy2 = weighted_box.tolist()
+            w_center = ((wx1 + wx2) / 2.0, (wy1 + wy2) / 2.0)
+
+            merged_c = dict(best_c)
+            merged_c["bbox"] = (wx1, wy1, wx2, wy2)
+            merged_c["center"] = w_center
+            merged_candidates.append(merged_c)
+
+    return merged_candidates
+
+
+def detect_target_candidates(yolo_model, frame, target_class_name, conf_threshold, device="cpu", imgsz=640):
+    """
+    Run YOLOv8n on the frame with specified confidence threshold and imgsz resolution.
     Returns list of dicts: {bbox, conf, center, yolo_label, vlm_label (may be None)}
     """
-    results = yolo_model.predict(source=frame, verbose=False, conf=conf_threshold, device=device)
+    results = yolo_model.predict(source=frame, verbose=False, conf=conf_threshold, device=device, imgsz=imgsz)
     r = results[0]
     candidates = []
     if r.boxes is None:
@@ -384,15 +542,63 @@ def detect_target_candidates(yolo_model, frame, target_class_name, conf_threshol
             "conf":       conf,
             "center":     center,
             "yolo_label": label,
-            "vlm_label":  None,    # filled in by SmolObjectClassifier if triggered
+            "vlm_label":  None,
         })
-    return candidates
+
+    return bwcd_nms(candidates, iou_thresh=0.45)
+
+
+def detect_tiled_candidates(yolo_model, frame, target_class_name, conf_threshold, device="cpu", imgsz=640, grid=(2, 2), overlap=0.2):
+    """
+    SAHI-style tiled inference for small-object recall during search mode.
+    Slices the full frame into overlapping tiles, runs YOLO on each tile,
+    offsets bounding boxes to full-frame coordinates, and applies BWCD-NMS.
+
+    COST WARNING under the 2-core Pi5 budget: this runs (nx*ny) full YOLO
+    inference passes per call instead of 1. Only enable via ENABLE_TILED_SEARCH
+    while unlocked/searching (never while locked+tracking), and rely on the
+    existing DETECT_EVERY_N_FRAMES frame-skip logic to keep this from running
+    every single frame -- see Issue 2 tiering discussion in project notes.
+    """
+    h, w = frame.shape[:2]
+    nx, ny = grid
+    tile_w = int(w / nx)
+    tile_h = int(h / ny)
+    pad_w = int(tile_w * overlap)
+    pad_h = int(tile_h * overlap)
+
+    raw_candidates = []
+    for ix in range(nx):
+        for iy in range(ny):
+            x1 = max(0, ix * tile_w - pad_w)
+            y1 = max(0, iy * tile_h - pad_h)
+            x2 = min(w, (ix + 1) * tile_w + pad_w)
+            y2 = min(h, (iy + 1) * tile_h + pad_h)
+
+            tile = frame[y1:y2, x1:x2]
+            if tile.size == 0 or tile.shape[0] < 32 or tile.shape[1] < 32:
+                continue
+
+            tile_candidates = detect_target_candidates(
+                yolo_model, tile, target_class_name, conf_threshold, device=device, imgsz=imgsz
+            )
+            for c in tile_candidates:
+                bx1, by1, bx2, by2 = c["bbox"]
+                c["bbox"]   = (bx1 + x1, by1 + y1, bx2 + x1, by2 + y1)
+                cx, cy      = c["center"]
+                c["center"] = (cx + x1, cy + y1)
+                raw_candidates.append(c)
+
+    if not raw_candidates:
+        return []
+
+    return bwcd_nms(raw_candidates, iou_thresh=0.45)
 
 
 def detect_in_roi(yolo_model, frame, predicted_xy, roi_pad,
-                  target_class_name, conf_threshold, device="cpu"):
+                  target_class_name, conf_threshold, device="cpu", imgsz=640):
     """
-    Phase D: Run YOLO on a padded crop around the Kalman-predicted position.
+    Run YOLO on a padded crop around the Kalman-predicted position.
     Returns candidates with bboxes offset back to full-frame coordinates.
     Falls back to full-frame detection if the ROI is degenerate.
     """
@@ -404,23 +610,22 @@ def detect_in_roi(yolo_model, frame, predicted_xy, roi_pad,
     y2_roi = min(h, py + roi_pad)
 
     if (x2_roi - x1_roi) < 32 or (y2_roi - y1_roi) < 32:
-        return detect_target_candidates(yolo_model, frame, target_class_name, conf_threshold, device=device)
+        return detect_target_candidates(yolo_model, frame, target_class_name, conf_threshold, device=device, imgsz=imgsz)
 
     roi = frame[y1_roi:y2_roi, x1_roi:x2_roi]
-    candidates = detect_target_candidates(yolo_model, roi, target_class_name, conf_threshold, device=device)
+    candidates = detect_target_candidates(yolo_model, roi, target_class_name, conf_threshold, device=device, imgsz=imgsz)
 
-    # Offset bboxes back to full-frame coordinates
     for c in candidates:
         bx1, by1, bx2, by2 = c["bbox"]
         c["bbox"]   = (bx1 + x1_roi, by1 + y1_roi, bx2 + x1_roi, by2 + y1_roi)
         cx, cy      = c["center"]
         c["center"] = (cx + x1_roi, cy + y1_roi)
 
-    return candidates
+    return bwcd_nms(candidates, iou_thresh=0.45)
 
 
 def _iou(box_a, box_b) -> float:
-    """Phase G: Intersection-over-Union for two (x1,y1,x2,y2) boxes."""
+    """Intersection-over-Union for two (x1,y1,x2,y2) boxes."""
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
@@ -434,11 +639,7 @@ def _iou(box_a, box_b) -> float:
 
 
 def pick_best_candidate(candidates, predicted_xy, max_dist_px, last_known_bbox=None):
-    """
-    Phase G: Combined distance + IoU scoring to reduce identity switches.
-    Distance component: 1 - (dist / max_dist_px), clipped to [0, 1].
-    IoU component: overlap between candidate box and last known box.
-    """
+    """Combined distance + IoU scoring to reduce identity switches."""
     best, best_score = None, -1.0
     for c in candidates:
         dist = ((c["center"][0] - predicted_xy[0]) ** 2 +
@@ -466,17 +667,8 @@ def crop_bbox(frame, bbox, pad=10):
     return frame[y1:y2, x1:x2]
 
 
-# ============================================================
-# Phase A: VLM future watchdog helper
-# ============================================================
-
 def _reap_future(future, timeout_sec=VLM_TIMEOUT_SEC):
-    """
-    Non-blocking check on a completed future.
-    If the future has been running longer than timeout_sec, logs a warning
-    and returns (None, True) — caller should abandon this future.
-    Returns (result, done_flag).
-    """
+    """Non-blocking check on a completed future. Abandons stuck futures past timeout_sec."""
     if future is None:
         return None, False
     if future.done():
@@ -496,9 +688,7 @@ class CommandReceiver:
     """
     Binds a UDP socket on CMD_UDP_PORT and deserialises incoming JSON
     command packets (sent by voice_command_interface.py).
-
-    Commands arrive as:
-        {"action": "follow", "target": "red jacket", "params": {}}
+    Commands arrive as: {"action": "follow", "target": "red jacket", "params": {}}
     """
 
     def __init__(self, host=CMD_UDP_HOST, port=CMD_UDP_PORT):
@@ -541,17 +731,24 @@ MISSION_RTL     = "rtl"
 # ============================================================
 
 def main():
-    cam_source = select_camera()
-    run_device = select_device()
+    args = parse_args()
+
+    # --- Set the hard thread/core budget FIRST, before any torch/model work ---
+    set_thread_budget(args.max_cores)
+    print(f"[ENGINE] Hard thread/core budget: {args.max_cores} "
+          f"(torch intra-op threads AND OS CPU affinity both pinned to this value)")
+
+    cam_source = select_camera(args)
+    run_device = select_device(args)
 
     print("=" * 62)
-    print(" Drone Tracking Engine — Phase 1-6 + Optimized A/B/D/G/I")
-    print(f" Device: {run_device.upper()}  | YOLOv8n + Kalman + ORB-ReID + SmolVLM")
+    print(" Drone Tracking Engine — Phase 1-6 + Optimized A/B/C/D/G/I + Pi5 budget")
+    print(f" Device: {run_device.upper()}  | Core budget: {args.max_cores} "
+          f"| YOLOv8n + Kalman + ORB-ReID + SmolVLM")
     print("=" * 62)
     print(" Keys: [q] quit  [l] lock target  [u] unlock  [h] hover  [s] search  [r] RTL  [p] timing HUD")
     print("=" * 62)
 
-    # --- Load SmolVLM ONCE; share across reid + small-object classifier ---
     print(f"[ENGINE] Loading SmolVLM-256M-Instruct on {run_device} ...")
     from transformers import AutoProcessor
 
@@ -569,9 +766,10 @@ def main():
     vlm_model.eval()
     print(f"[ENGINE] SmolVLM loaded on {run_device} ({model_dtype}). Sharing with ReID + Classifier.")
 
-    # --- Subsystems ---
-    # H1+H2 fix: shared inference lock ensures SmolVLM model.generate() is never called
-    # concurrently by cls_executor and reid_executor threads at the same time.
+    # shared_inference_lock ensures SmolVLM model.generate() is never called
+    # concurrently by cls_executor and reid_executor threads, AND makes the
+    # scoped thread-priority drop in each module's _low_priority_inference()
+    # safe (no other thread can be mid-inference while thread count changes).
     shared_inference_lock = threading.Lock()
     yolo_model  = YOLO(YOLO_MODEL_PATH)
     reid        = ReIDEngine(shared_model=vlm_model, shared_processor=processor,
@@ -581,7 +779,6 @@ def main():
     drone       = Sim2DDroneController(world_size=(FRAME_WIDTH, FRAME_HEIGHT))
     cmd_recv    = CommandReceiver()
 
-    # --- Camera ---
     print(f"[ENGINE] Connecting to camera source: {cam_source} (Threaded Zero-Lag Stream)...")
     cap = ThreadedCameraStream(cam_source, target_size=(FRAME_WIDTH, FRAME_HEIGHT))
 
@@ -597,47 +794,44 @@ def main():
     reid_status       = ""
     frame_count       = 0
     current_target_class = TARGET_CLASS_NAME
-    last_known_bbox   = None    # Phase G: for IoU-based re-acquisition
+    last_known_bbox   = None
 
-    # Phase A: TWO dedicated single-worker executors (concurrent, not queued)
     cls_executor  = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     reid_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     classification_future = None
     reid_future           = None
-    vlm_spatial_cache     = []  # {center, label, time}
+    vlm_spatial_cache     = []
 
-    # H1 fix: throttle classifier submissions to max once per 5 seconds globally
-    # so SmolVLM never runs back-to-back continuously.
     CLASSIFY_COOLDOWN_SEC = 5.0
     last_cls_submit_time  = 0.0
 
-    # Phase I + Step 1: per-stage timers (all stages)
     t_yolo     = PerfTimer("yolo")
     t_kf       = PerfTimer("kalman")
     t_ovl      = PerfTimer("overlay")
     t_loop     = PerfTimer("loop")
-    t_cam_read = PerfTimer("cam_read")   # Step 1: main-thread cap.read() wall time
-    t_imshow   = PerfTimer("imshow")     # Step 1: cv2.imshow + waitKey combined
-    show_timing = False   # toggled by [p] key
+    t_cam_read = PerfTimer("cam_read")
+    t_imshow   = PerfTimer("imshow")
+    show_timing = False
 
-    # Phase I: separate FPS counters
-    loop_fps_samples: list[float] = []
+    loop_fps_samples: list = []
     yolo_detect_count   = 0
     vlm_complete_count  = 0
     fps_window_start    = time.time()
 
-    # Step 1: rolling CSV dump every CSV_DUMP_INTERVAL_SEC
     CSV_DUMP_INTERVAL_SEC = 5.0
     _csv_last_dump = time.time()
-    _csv_rows: list[dict] = []   # accumulated since last dump
+    _csv_rows: list = []
     print(f"[DIAG] Per-stage CSV will be printed to console every {CSV_DUMP_INTERVAL_SEC:.0f}s.")
     print("[DIAG] Columns: wall_time,loop_ms,cam_read_ms,cam_thread_ms,copy_ms,"
           "yolo_ms,kf_ms,ovl_ms,imshow_ms,bg_gap_mean_ms,bg_gap_max_ms")
 
+    # Periodic budget-drift verification (separate cadence from the CSV dump)
+    BUDGET_VERIFY_INTERVAL_SEC = 15.0
+    _budget_last_check = time.time()
+
     while True:
         t_loop.start()
 
-        # Step 1: time cap.read() on the main thread
         with t_cam_read:
             ret, frame = cap.read()
         if not ret:
@@ -686,29 +880,32 @@ def main():
 
             print(f"[ENGINE] Mission → {mission_state}  |  {status_text}")
 
-        # ---- 2. Phase D: frame-skip + ROI detection ----
+        # ---- 2. Frame-skip + ROI/tiled/full detection ----
         with t_yolo:
             stable_track = locked and tracker is not None and tracker.frames_since_update < 5
-            if stable_track:
-                skip_n = DETECT_EVERY_N_FRAMES_LOCKED
-            else:
-                skip_n = DETECT_EVERY_N_FRAMES
+            skip_n = DETECT_EVERY_N_FRAMES_LOCKED if stable_track else DETECT_EVERY_N_FRAMES
 
             if frame_count % skip_n == 0:
                 if stable_track and tracker is not None:
                     predicted_xy = tracker.get_position()
                     candidates = detect_in_roi(
                         yolo_model, frame, predicted_xy, ROI_PAD_PX,
-                        current_target_class, DETECTION_CONFIDENCE, device=run_device
+                        current_target_class, DETECTION_CONFIDENCE_LOCKED, device=run_device, imgsz=YOLO_IMGSZ
                     )
                 else:
-                    candidates = detect_target_candidates(
-                        yolo_model, frame, current_target_class, DETECTION_CONFIDENCE, device=run_device
-                    )
+                    conf_thresh = DETECTION_CONFIDENCE_SEARCH if not locked else DETECTION_CONFIDENCE_LOCKED
+                    if ENABLE_TILED_SEARCH and not locked:
+                        candidates = detect_tiled_candidates(
+                            yolo_model, frame, current_target_class, conf_thresh, device=run_device, imgsz=YOLO_IMGSZ
+                        )
+                    else:
+                        candidates = detect_target_candidates(
+                            yolo_model, frame, current_target_class, conf_thresh, device=run_device, imgsz=YOLO_IMGSZ
+                        )
                 yolo_detect_count += 1
             # else: reuse candidates from previous frame (already in scope)
 
-        # ---- 3. Phase A: Reap async VLM results ----
+        # ---- 3. Reap async VLM results ----
         now = time.time()
 
         res, done = _reap_future(classification_future)
@@ -733,7 +930,6 @@ def main():
                     print(f"[ENGINE] HUD label ready: '{res}'")
                 vlm_complete_count += 1
 
-        # Apply spatial cache and trigger new classifications
         vlm_spatial_cache = [entry for entry in vlm_spatial_cache if now - entry["time"] < 4.0]
         for c in candidates:
             cx, cy = c["center"]
@@ -745,7 +941,6 @@ def main():
 
             if not c["vlm_label"]:
                 area = (c["bbox"][2] - c["bbox"][0]) * (c["bbox"][3] - c["bbox"][1])
-                # H1 fix: require area/conf criteria AND classification_future is None AND 5s cooldown
                 if ((area < 4096 or c["conf"] < 0.55) and
                     classification_future is None and
                     (now - last_cls_submit_time) >= CLASSIFY_COOLDOWN_SEC):
@@ -754,7 +949,6 @@ def main():
                     crop = crop_bbox(frame, c["bbox"]).copy()
                     def _classify_task(img, center):
                         return {"label": classifier.classify(img), "center": center, "time": time.time()}
-                    # Phase A: submit to dedicated cls_executor
                     classification_future = cls_executor.submit(_classify_task, crop, c["center"])
 
         # Auto-lock target when in MISSION_FOLLOW if not locked yet
@@ -764,17 +958,18 @@ def main():
             last_known_bbox = best["bbox"]
             crop = crop_bbox(frame, best["bbox"])
             if crop.size > 0:
+                _t_lock0 = time.perf_counter()
                 if best.get("vlm_label"):
                     reid.target_tag = best["vlm_label"]
                     reid.lock_target(crop.copy())
                 else:
                     reid.target_tag = current_target_class
                     crop_copy = crop.copy()
-                    # Phase A + H2 fix: lock_target stores embedding (fast, ~5ms);
-                    # generate HUD label async ONLY if reid.should_generate_hud_now() is True
                     reid.lock_target(crop_copy)
                     if reid_future is None and reid.should_generate_hud_now():
                         reid_future = reid_executor.submit(reid.generate_hud_label, crop_copy)
+                dt_lock_ms = (time.perf_counter() - _t_lock0) * 1000.0
+                print(f"[DIAG] reid.lock_target took {dt_lock_ms:.2f}ms (should be ~ORB-fast, <20ms)")
             locked = True
             status_text = f"Auto-locked {current_target_class} — following"
             print(f"[ENGINE] Auto-locked target ({current_target_class}).")
@@ -793,7 +988,6 @@ def main():
                     last_known_bbox = match["bbox"]
                     crop = crop_bbox(frame, match["bbox"])
 
-                    # Phase C: Periodic embedding-based re-ID (fast: ~5ms, every 0.5s)
                     if reid.should_check_now() and crop.size > 0 and reid_future is None:
                         reid.last_check_time = time.time()
                         crop_copy = crop.copy()
@@ -803,7 +997,6 @@ def main():
                 else:
                     status_text = "Coasting on Kalman (no match)"
 
-                # ---- 5. Decision → drone commands ----
                 if tracker.is_lost(MAX_MISSED_FRAMES):
                     drone.search_pattern()
                     status_text = "Target lost — searching"
@@ -823,34 +1016,31 @@ def main():
                     if tracker.has_changed_course():
                         status_text += " | course change → adjusting"
 
-        # Non-FOLLOW mission states — drone controller already set; just advance physics
         drone.step_physics()
 
         # ---- 6. Draw overlay ----
         with t_ovl:
             current_fps = 1000.0 / max(sum(loop_fps_samples) / len(loop_fps_samples), 0.001) if loop_fps_samples else 0.0
+            target_disp = reid.target_tag or current_target_class
             _draw_overlay(frame, candidates, tracker, locked, drone,
-                          status_text, reid_status, mission_state, cam_source, fps=current_fps)
+                          status_text, reid_status, mission_state, cam_source, fps=current_fps,
+                          target_label=target_disp, device=run_device, max_cores=args.max_cores)
 
-            # Phase I + Step 1: timing HUD
             if show_timing:
                 _draw_timing(frame, t_yolo, t_kf, t_ovl,
                              loop_fps_samples, yolo_detect_count,
                              vlm_complete_count, fps_window_start,
                              t_cam_read=t_cam_read, t_imshow=t_imshow, cap=cap)
 
-        # Step 1: time imshow + waitKey together
         with t_imshow:
             cv2.imshow("Drone Tracking Engine", frame)
             key = cv2.waitKey(1) & 0xFF
         t_loop.stop()
 
-        # Phase I: rolling FPS tracking
         loop_fps_samples.append(t_loop.avg_ms())
         if len(loop_fps_samples) > 30:
             loop_fps_samples.pop(0)
 
-        # Step 1: accumulate CSV row
         bg_gap_mean, bg_gap_max = cap.get_bg_gap_stats()
         _csv_rows.append({
             "wall_time":      f"{time.time():.3f}",
@@ -866,13 +1056,11 @@ def main():
             "bg_gap_max_ms":  f"{bg_gap_max:.2f}",
         })
 
-        # Step 1: dump CSV every CSV_DUMP_INTERVAL_SEC
         _now = time.time()
         if _now - _csv_last_dump >= CSV_DUMP_INTERVAL_SEC and _csv_rows:
             buf = io.StringIO()
             writer = csv.DictWriter(buf, fieldnames=list(_csv_rows[0].keys()))
             writer.writeheader()
-            # write only the last 30 rows (one per frame) to keep output concise
             for row in _csv_rows[-30:]:
                 writer.writerow(row)
             print("\n[DIAG CSV] --- 5-second rolling dump ---")
@@ -880,6 +1068,13 @@ def main():
             print("[DIAG CSV] --- end ---\n")
             _csv_rows.clear()
             _csv_last_dump = _now
+
+        # Periodic budget-drift check — catches any library silently
+        # re-claiming threads/cores mid-run (rare, but worth surfacing).
+        if _now - _budget_last_check >= BUDGET_VERIFY_INTERVAL_SEC:
+            verify_thread_budget(args.max_cores, context="runtime")
+            _budget_last_check = _now
+
         if key == ord('q'):
             break
 
@@ -946,14 +1141,15 @@ def main():
 # ============================================================
 
 def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
-                  reid_status, mission, cam_source=0, fps=0.0):
+                  reid_status, mission, cam_source=0, fps=0.0, target_label="",
+                  device="cpu", max_cores=2):
     """Render all bounding boxes, labels, tracker ring, drone dot, and HUD text."""
     h, w = frame.shape[:2]
 
     for c in candidates:
         x1, y1, x2, y2 = [int(v) for v in c["bbox"]]
         if c.get("is_locked"):
-            box_color = (0, 0, 255)  # Bright Red for locked target
+            box_color = (0, 0, 255)
             thickness = 2
         elif c["vlm_label"]:
             box_color = (80, 80, 220)
@@ -991,10 +1187,8 @@ def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
 
     cam_str = f"IP: {cam_source}" if isinstance(cam_source, str) else f"Laptop ({cam_source})"
 
-    # Status text on top left (10, 22)
     _text(status_text[:72], 22)
 
-    # Display FPS prominently at top right (w - fps_w - 15, 22)
     fps_str = f"FPS: {fps:.1f}"
     (fps_w, _), _ = cv2.getTextSize(fps_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
     _text(fps_str, 22, color=(0, 255, 120), x=w - fps_w - 15)
@@ -1002,6 +1196,27 @@ def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
     _text(f"Mission: {mission.upper()}  |  Drone: {state['status']}  |  {cam_str}", 44, mission_color)
     if reid_status:
         _text(reid_status, 66, (180, 220, 255))
+
+    if target_label:
+        lbl_str = f"Target: {target_label.upper()}"
+        (lbl_w, lbl_h), baseline = cv2.getTextSize(lbl_str, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.rectangle(frame, (8, h - 25 - lbl_h - 4), (12 + lbl_w, h - 25 + baseline), (240, 240, 240), -1)
+        cv2.rectangle(frame, (8, h - 25 - lbl_h - 4), (12 + lbl_w, h - 25 + baseline), (180, 180, 180), 1)
+        cv2.putText(frame, lbl_str, (10, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
+    # NOTE: torch.get_num_threads() here reflects the MAIN THREAD's view of the
+    # process-wide setting. It will read as `max_cores` most of the time, but
+    # will briefly read as 1 (VLM_LOW_PRIORITY_THREADS) during the exact window
+    # a background VLM call is executing its scoped low-priority section --
+    # that's expected and not a bug; it's the fix working as intended.
+    active_threads = torch.get_num_threads()
+    total_cores = os.cpu_count() or 4
+    if device == "cpu":
+        cpu_str = f"Threads: {active_threads}/{max_cores} budget ({total_cores} cores total)"
+    else:
+        cpu_str = f"Device: CUDA (budget {max_cores}/{total_cores} threads)"
+    (cpu_w, _), _ = cv2.getTextSize(cpu_str, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    _text(cpu_str, h - 25, color=(0, 230, 255), x=w - cpu_w - 12)
 
     legend = "[q]quit [l]lock [u]unlock [h]hover [s]search [r]rtl [p]timing"
     cv2.putText(frame, legend, (8, h - 8),
@@ -1011,7 +1226,7 @@ def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
 def _draw_timing(frame, t_yolo, t_kf, t_ovl, loop_fps_samples,
                  yolo_count, vlm_count, fps_start,
                  t_cam_read=None, t_imshow=None, cap=None):
-    """Step 1 + Phase I: overlay all per-stage timing stats when [p] is pressed."""
+    """Overlay all per-stage timing stats when [p] is pressed."""
     elapsed = time.time() - fps_start
     main_fps  = 1000.0 / max(sum(loop_fps_samples) / len(loop_fps_samples), 1) if loop_fps_samples else 0
     yolo_fps  = yolo_count / max(elapsed, 0.001)
