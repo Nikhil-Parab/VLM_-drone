@@ -828,8 +828,9 @@ def main():
 
         # ---- 6. Draw overlay ----
         with t_ovl:
+            current_fps = 1000.0 / max(sum(loop_fps_samples) / len(loop_fps_samples), 0.001) if loop_fps_samples else 0.0
             _draw_overlay(frame, candidates, tracker, locked, drone,
-                          status_text, reid_status, mission_state, cam_source)
+                          status_text, reid_status, mission_state, cam_source, fps=current_fps)
 
             # Phase I + Step 1: timing HUD
             if show_timing:
@@ -945,7 +946,7 @@ def main():
 # ============================================================
 
 def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
-                  reid_status, mission, cam_source=0):
+                  reid_status, mission, cam_source=0, fps=0.0):
     """Render all bounding boxes, labels, tracker ring, drone dot, and HUD text."""
     h, w = frame.shape[:2]
 
@@ -979,9 +980,9 @@ def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
         cv2.circle(frame, (int(dx), int(dy)), 7, (255, 140, 0), -1)
         cv2.circle(frame, (int(dx), int(dy)), 7, (255, 200, 0), 1)
 
-    def _text(txt, y, color=(255, 255, 255)):
-        cv2.putText(frame, txt, (9,  y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        cv2.putText(frame, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color,     1)
+    def _text(txt, y, color=(255, 255, 255), x=10):
+        cv2.putText(frame, txt, (x - 1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(frame, txt, (x,     y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color,     1)
 
     mission_color = {
         "follow": (80, 220, 80), "hover": (220, 200, 60),
@@ -990,7 +991,14 @@ def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
 
     cam_str = f"IP: {cam_source}" if isinstance(cam_source, str) else f"Laptop ({cam_source})"
 
+    # Status text on top left (10, 22)
     _text(status_text[:72], 22)
+
+    # Display FPS prominently at top right (w - fps_w - 15, 22)
+    fps_str = f"FPS: {fps:.1f}"
+    (fps_w, _), _ = cv2.getTextSize(fps_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    _text(fps_str, 22, color=(0, 255, 120), x=w - fps_w - 15)
+
     _text(f"Mission: {mission.upper()}  |  Drone: {state['status']}  |  {cam_str}", 44, mission_color)
     if reid_status:
         _text(reid_status, 66, (180, 220, 255))
