@@ -16,8 +16,9 @@ It uses a multi-stage vision and language pipeline:
 
 ## Detailed Chat Trajectory & Problem Resolution
 
-### Phase 1–4 Base Engine
-- Built Kalman filter, YOLOv8n integration, SmolVLM re-ID engine, and Pygame sim controller.
+### Phase 1–4 Base Engine & Environment Resolution
+- **Environment & PyTorch Resolution:** Configured Python virtual environment (`.venv`) resolving missing PyTorch (`torch`) and CUDA/CPU fallback dependencies along with `ultralytics`, `opencv-python`, `transformers`, `pillow`, `pygame`, `numpy`, `speechrecognition`, and `pyaudio`.
+- **Core Pipeline:** Built Kalman filter, YOLOv8n integration, SmolVLM re-ID engine, and Pygame sim controller.
 
 ### Phase 5 & 6 Enhancements
 - Added `small_object_classifier.py`: Enriches tiny/uncertain YOLO crops with SmolVLM descriptions.
@@ -36,7 +37,7 @@ It uses a multi-stage vision and language pipeline:
 
 3. **Background Thread Offloading for VLM (Camera Freezes):**
    - *Issue:* Synchronous VLM inference on CPU took ~10s, blocking `cap.read()` and `cv2.imshow()`, causing camera feed freezes.
-   - *Fix:* Offloaded VLM classification and Re-ID verification in `drone_tracking_engine.py` to an asynchronous `ThreadPoolExecutor`. Added a 4-second spatial cache for VLM labels.
+   - *Fix:* Offloaded VLM classification and Re-ID verification in `drone_tracking_engine.py` to dedicated asynchronous `ThreadPoolExecutor`s (`cls_executor` and `reid_executor`). Added a 4-second spatial cache for VLM labels and VLM timeout watchdog.
 
 4. **Prompt Decoding Fix:**
    - *Issue:* Model output leaked prompt prefixes like `user:`.
@@ -54,6 +55,32 @@ It uses a multi-stage vision and language pipeline:
    - *Issue:* Sending "follow the mobile phone" did not automatically lock onto the detected object, requiring manual `l` key press. Pressing `l` ran synchronous `reid.lock_target`, causing a 10s main-thread freeze.
    - *Fix:* Added auto-locking when entering `MISSION_FOLLOW` with detected candidates. Offloaded `reid.lock_target` tag generation to background thread pool.
 
+8. **System Performance Optimization (Phases A, B, D, G, I):**
+   - **Phase A:** Isolated classification and ReID thread pools with timeout watchdog.
+   - **Phase B:** Set `torch.set_num_threads(2)` at startup to prevent intra-op CPU core contention.
+   - **Phase D:** Enabled YOLO ROI cropping (`ROI_PAD_PX = 120`) around Kalman prediction and locked frame-skipping (`DETECT_EVERY_N_FRAMES_LOCKED = 3`).
+   - **Phase G:** Implemented distance + IoU candidate scoring in `pick_best_candidate()`.
+   - **Phase I:** Added `PerfTimer` per-stage instrumentation, rolling CSV diagnostics, and `[p]` key HUD toggle.
+
+9. **Top-Right Live FPS Overlay:**
+   - *Feature:* Real-time loop FPS calculation displayed prominently in neon green (`#00FF78`) at the **top right corner** (`x = w - fps_w - 15, y = 22`), while keeping primary status text on the top left.
+
+11. **CPU Thread Optimization & Scoped VLM Capping (Issue 1):**
+    - *Diagnostic:* Identified that capping global PyTorch intra-op threads to 2 constrained YOLOv8n inference on CPU. When target locked or voice follow activated, background VLM calls competed with YOLO for the same 2-thread pool.
+    - *Fix:* Increased global PyTorch thread budget to 3 for high-priority YOLO & main loop execution. Created `VLMThreadLimiter(1)` context manager to temporarily drop PyTorch threads to 1 ONLY during background VLM `model.generate()` calls.
+    - *Fast Path Audit:* Verified `reid.lock_target()` runs pure ORB+HSV feature extraction (~5ms) on main thread without blocking.
+
+12. **Small-Object Recall & Sub-Part Architecture (Issue 2):**
+    - *Clarification:* Confirmed COCO-trained YOLOv8n model label space (80 categories) contains no body sub-parts (e.g. no "nose"). Sub-part detection requires dedicated landmark models (e.g. MediaPipe Face Mesh).
+    - *Two-Tier Thresholding:* Implemented dual confidence thresholds (`0.25` for unlocked search, `0.40` for locked tracking).
+    - *Resolution Scaling (`imgsz`):* Added configurable YOLO inference resolution (`YOLO_IMGSZ=640/960/1280`).
+    - *SAHI-Style Tiled Search:* Added 2x2 grid slicing with 20% overlap and OpenCV NMS (`detect_tiled_candidates`) for enhanced small-object recall during search mode.
+
+13. **Raspberry Pi 5 2-Thread Constrained Pass (BWCD-NMS & Core Pinning):**
+    - *Hard Core Constraint:* Enforced 2-core budget allocation (`os.sched_setaffinity(0, {0, 1})` on Linux/Pi 5) and `torch.set_num_threads(2)` process cap, leaving 2 cores reserved for MAVLink/Pixhawk & OS tasks.
+    - *BWCD-NMS Integration:* Implemented Batch-mode Weighted-Cluster DIoU-NMS (`bwcd_nms`) for zero-cost postprocessing with center-distance penalty ($R_{DIoU}$) and coordinate-weighted box merging across detection candidates.
+    - *Scoped Thread Allocation:* Kept `VLMThreadLimiter(1)` active during background `.generate()` calls so VLM tasks drop to 1 thread, giving main loop & YOLO 2-thread priority.
+
 ---
 
 ## Workspace File Structure
@@ -67,6 +94,7 @@ It uses a multi-stage vision and language pipeline:
 - `c:\codes\drone_vlm\drone_engine\_smoke_test.py` — Logic & synonym test script
 - `c:\codes\drone_vlm\drone_engine\requirements.txt` — Dependencies list
 - `c:\codes\drone_vlm\anticontext\context.md` — Complete conversation and project context log
+- `c:\codes\drone_vlm\anticontext\code.zip` — Zipped archive of all project source code and docs
 
 ---
 
@@ -92,3 +120,4 @@ It uses a multi-stage vision and language pipeline:
    - `[h]` — Hover
    - `[s]` — Search pattern
    - `[r]` — Return to Launch (RTL)
+   - `[p]` — Toggle timing HUD

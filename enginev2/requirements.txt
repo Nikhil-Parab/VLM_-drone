@@ -3,6 +3,9 @@
 # Phases 1-6: Detection · Tracking · Re-ID · Voice Commands · Small-Object VLM
 # ================================================================
 
+# --- Open-vocabulary grounding (master plan Phase 1) ---
+# transformers already required for SmolVLM; Grounding DINO uses same stack
+
 # --- Core vision pipeline ---
 opencv-python
 numpy

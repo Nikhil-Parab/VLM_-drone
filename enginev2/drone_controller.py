@@ -1,23 +1,12 @@
 """
-drone_controller.py
-=====================
-Abstract drone controller interface, with two implementations:
+drone_controller.py — DroneController interface, two backends:
+  Sim2DDroneController  — pygame 2D sim, runs standalone (python drone_controller.py)
+  MAVSDKDroneController — PX4 SITL reference stub via MAVSDK-Python (untested
+                           without a live SITL instance - async, bridged via
+                           a background asyncio thread, see class docstring)
 
-1. Sim2DDroneController — a small pygame 2D simulator. Runs standalone,
-   no external installs beyond pygame. Good for testing the tracking
-   engine's DECISION logic (move/hold/search/scan commands) end-to-end today.
-
-2. MAVSDKDroneController — a REFERENCE STUB for wiring into a real PX4 SITL
-   simulation (e.g. Gazebo+PX4) via MAVSDK-Python. Structurally correct but
-   untested without an actual SITL environment — see class docstring.
-
-Phase 5 additions (voice command integration):
-  • scan_waypoints(waypoints)  — cycle through a list of (x, y) positions
-    (sim) or NED waypoints (MAVSDK stub); used by 'scan' / 'survey' commands.
-  • return_to_launch()         — RTL action; sim recentres, MAVSDK calls RTL.
-
-pip install: pygame  (for Sim2DDroneController)
-pip install: mavsdk  (only if/when you use MAVSDKDroneController)
+move_toward/hold_position/search_pattern/scan_waypoints/return_to_launch
+form the shared command surface both backends implement.
 """
 
 import math
@@ -79,6 +68,11 @@ class Sim2DDroneController(DroneController):
         self.lock = threading.Lock()
         self._scan_waypoints = []           # list of (x,y) for scan/survey missions
         self._scan_index = 0
+        # Simulated altitude (meters) for activation state machine / telemetry
+        self.altitude_m = 0.0
+        self.target_altitude_m = 0.0
+        self.climb_rate_mps = 1.5         # meters per second in sim
+        self.home_pos = tuple(self.pos)
 
     def move_toward(self, dx, dy):
         dist = math.hypot(dx, dy)
@@ -143,9 +137,24 @@ class Sim2DDroneController(DroneController):
             self.vel[1] += (dy / max(math.hypot(dx, dy), 1e-3)) * self.accel * 2
             self.status_text = "returning to launch"
 
+    def set_altitude_target(self, altitude_m: float):
+        """Command climb/descent toward target altitude (sim telemetry)."""
+        with self.lock:
+            self.target_altitude_m = max(0.0, float(altitude_m))
+            if abs(self.altitude_m - self.target_altitude_m) > 0.05:
+                self.status_text = "climbing" if self.target_altitude_m > self.altitude_m else "descending"
+
     def step_physics(self):
         """Call once per simulation tick to advance the drone's position."""
         with self.lock:
+            # Altitude step (1 sim tick ≈ 1/30 s when called from 30fps loop)
+            dt = 1.0 / 30.0
+            if abs(self.altitude_m - self.target_altitude_m) > 0.05:
+                step = self.climb_rate_mps * dt
+                if self.altitude_m < self.target_altitude_m:
+                    self.altitude_m = min(self.target_altitude_m, self.altitude_m + step)
+                else:
+                    self.altitude_m = max(self.target_altitude_m, self.altitude_m - step)
             if self.status_text == "scanning waypoints":
                 self._advance_scan()
             speed = math.hypot(*self.vel)
@@ -162,7 +171,13 @@ class Sim2DDroneController(DroneController):
 
     def get_state(self):
         with self.lock:
-            return {"position": tuple(self.pos), "velocity": tuple(self.vel), "status": self.status_text}
+            return {
+                "position": tuple(self.pos),
+                "velocity": tuple(self.vel),
+                "status": self.status_text,
+                "altitude_m": self.altitude_m,
+                "target_altitude_m": self.target_altitude_m,
+            }
 
 
 def run_sim2d_demo():

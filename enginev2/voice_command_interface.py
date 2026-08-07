@@ -166,7 +166,24 @@ COCO_CLASS_MAP = {
     "kite":         "kite",
 }
 
-# Regex patterns to extract target object from the instruction text
+# Multi-slot direction tokens (Phase 6 — compound commands)
+DIRECTION_TOKENS = {
+    "left": "left", "right": "right", "up": "up", "down": "down",
+    "forward": "forward", "backward": "backward", "back": "backward",
+    "north": "forward", "south": "backward", "east": "right", "west": "left",
+}
+
+SPEED_TOKENS = {
+    "slowly": "slow", "slow": "slow", "gentle": "slow", "gently": "slow",
+    "quickly": "fast", "fast": "fast", "quick": "fast", "aggressive": "fast",
+    "medium": "medium", "moderate": "medium", "normal": "medium",
+}
+
+ALTITUDE_PATTERNS = [
+    r"(?:to|at|reach|climb to|fly at)\s+(\d+(?:\.\d+)?)\s*(?:m|meters|metres|meter)",
+    r"height\s+(\d+(?:\.\d+)?)",
+    r"altitude\s+(\d+(?:\.\d+)?)",
+]
 # Tried in order; first match wins
 TARGET_PATTERNS = [
     r"(?:follow|track|chase|pursue|find|locate|watch)\s+(?:the\s+|a\s+|an\s+)?(.+)",
@@ -178,6 +195,36 @@ TARGET_PATTERNS = [
 # ============================================================
 # Helpers
 # ============================================================
+
+def _extract_directions(text: str) -> list:
+    """Parse compound direction tokens from one utterance."""
+    text = text.lower()
+    found = []
+    for token, canonical in sorted(DIRECTION_TOKENS.items(), key=lambda x: -len(x[0])):
+        if re.search(rf"\b{re.escape(token)}\b", text) and canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def _extract_speed(text: str) -> str:
+    text = text.lower()
+    for token, canonical in sorted(SPEED_TOKENS.items(), key=lambda x: -len(x[0])):
+        if token in text:
+            return canonical
+    return "medium"
+
+
+def _extract_altitude_m(text: str) -> Optional[float]:
+    text = text.lower()
+    for pat in ALTITUDE_PATTERNS:
+        m = re.search(pat, text)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return None
+
 
 def _extract_target(text: str) -> Optional[str]:
     """
@@ -309,11 +356,21 @@ class CommandParser:
         # 2. Target object extraction
         raw_target = _extract_target(text)
         coco_class = _normalise_coco(raw_target)
+        directions = _extract_directions(text)
+        speed = _extract_speed(text)
+        target_altitude_m = _extract_altitude_m(text)
+
+        # Open-vocabulary grounding phrase: full target text for Grounding DINO
+        grounding_phrase = raw_target or coco_class
 
         cmd = {
             "action":     action,
             "target":     raw_target,
             "coco_class": coco_class,
+            "grounding_phrase": grounding_phrase,
+            "directions": directions,
+            "speed":      speed,
+            "target_altitude_m": target_altitude_m,
             "params":     {},
         }
         return cmd

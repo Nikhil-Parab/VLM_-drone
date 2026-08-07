@@ -75,3 +75,5 @@ desktop.ini
 
 # HuggingFace & Torch local caches
 .cache/
+
+drone_vlm/anticontext/

@@ -1,57 +1,20 @@
 """
-drone_tracking_engine.py
-==========================
-Full pipeline — Phase 1-6 integrated + Optimization Phases A/B/C/D/G/I
-+ Pi5 hard 2-thread/2-core budget + scoped VLM thread-priority fix.
+drone_tracking_engine.py — main pipeline.
 
-  Phase A: Two dedicated ThreadPoolExecutors (cls + reid) so classification
-           and ReID run concurrently. VLM timeout watchdog abandons stuck calls.
-  Phase B: torch.set_num_threads(2) at startup (process-wide ceiling).
-  Phase C: ORB+histogram embedding ReID (fast, ~5ms) — VLM only used for the
-           optional HUD label, never for frame-to-frame ReID decisions.
-  Phase D: YOLO ROI crop (run detection only around Kalman-predicted position
-           when locked) + frame-skip when locked (DETECT_EVERY_N_FRAMES_LOCKED)
-           + two-tier confidence threshold + optional SAHI-style tiled search
-           + BWCD-NMS postprocessing for dense/small-object scenes.
-  Phase G: pick_best_candidate() uses combined distance+IoU score to reduce
-           identity switches when targets cross paths.
-  Phase I: PerfTimer per-stage instrumentation; [p] key toggles HUD timing.
+camera -> YOLOv8n (full-frame/ROI/tiled) -> BWCD-NMS -> SmolObjectClassifier
+(small/uncertain boxes only) -> Kalman tracker (predict/update every frame)
+-> embedding-based re-ID (every 0.5s, ~5ms) -> decision layer (stopped /
+course-changed / lost) -> DroneController command
+<- UDP command receiver on port 5000 (voice_command_interface.py sends here)
 
-  NEW — Pi5 thread-budget fixes:
-    * A single, unambiguous source of truth for the process's thread/core
-      ceiling (was previously set in two places that could silently
-      disagree — see apply_cpu_affinity()/set_thread_budget() below).
-    * VLM generate() calls (in reid_engine.py / small_object_classifier.py)
-      now run at a temporarily-reduced thread count so they can never starve
-      the main loop's share of the fixed 2-thread budget — see
-      _low_priority_inference() in those two files.
-    * Periodic console confirmation that the process is still actually
-      pinned to its intended cores/threads (drift/verification logging),
-      since individual libraries don't always respect a soft hint equally.
+Full phase-by-phase development history: CHANGELOG.md.
 
-  camera → YOLOv8n detection (full frame / ROI crop / tiled search)
-         → BWCD-NMS postprocessing
-         → SmolObjectClassifier  (small / uncertain boxes get VLM labels)
-         → Kalman tracker  (predict / update every frame)
-         → periodic embedding-based re-ID check  (every 0.5s, ~5ms per check)
-         → decision layer  (stopped / course-changed / lost)
-         → DroneController command  (move_toward / hold_position / search_pattern / scan / rtl)
-         ← UDP command receiver  (port 5000 — voice_command_interface.py sends here)
+Keys: q=quit  l=lock nearest  u=unlock  h=hover  s=search  r=RTL  p=timing HUD
 
-Controls (keyboard):
-  q  — quit
-  l  — lock onto the nearest high-confidence detection
-  u  — unlock target / hover
-  h  — hold / hover immediately
-  s  — trigger search pattern
-  r  — return to launch (sim: fly to centre)
-  p  — toggle per-stage timing HUD
-
-pip install: ultralytics opencv-python transformers torch pillow pygame numpy
 Run:
-    python drone_tracking_engine.py
-    python drone_tracking_engine.py --max-cores 2      # Pi5 production budget
-    python drone_tracking_engine.py --max-cores 4       # dev laptop, no cap
+    python drone_tracking_engine.py --max-cores 2   # Pi5 production
+    python drone_tracking_engine.py --detector grounding --svlm-control --skip-activation
+    python drone_tracking_engine.py --text via voice_command_interface.py
 """
 
 import argparse
@@ -66,86 +29,28 @@ import socket
 import threading
 import time
 
+# BLAS/OpenMP env caps applied inside thread_budget before numpy/torch load.
+from thread_budget import (
+    DEFAULT_MAX_CORES,
+    boost_main_thread_priority,
+    reapply_cv2_and_affinity,
+    repair_thread_budget_if_drifted,
+    set_background_thread_priority,
+    set_thread_budget,
+)
+
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
 
 from drone_controller import Sim2DDroneController
+from execution_layer import ExecutionLayer
+from grounding_engine import GroundingEngine, pick_best_grounded_candidate
 from kalman_tracker import KalmanTrack
 from reid_engine import ReIDEngine
 from small_object_classifier import SmolObjectClassifier
-
-# ============================================================
-# HARD THREAD/CORE BUDGET — single source of truth
-# ============================================================
-# Everything else in this file and in reid_engine.py / small_object_classifier.py
-# assumes this value is set ONCE, here, before any torch/model work happens,
-# and never silently overridden elsewhere. The previous version of this file
-# set torch.set_num_threads(2) at import time AND ALSO let select_camera()'s
-# --threads CLI flag override it later (with a broken log message that always
-# printed the same value twice) -- that made it possible for the effective
-# thread count to end up higher than the OS-level core affinity pin, which is
-# worse than either limit alone (oversubscription: more threads than cores
-# means the OS scheduler thrashes between them instead of running cleanly).
-# This version fixes that: --max-cores is now the ONE flag that controls both
-# torch's intra-op thread count and the OS affinity pin together, and they are
-# always kept equal.
-
-DEFAULT_MAX_CORES = 2  # <-- Pi5 production budget; override with --max-cores N
-
-
-def set_thread_budget(max_cores: int):
-    """
-    Set BOTH torch's intra-op thread count and the OS-level CPU affinity to
-    the same value, so the process can never oversubscribe (more torch
-    threads than pinned cores) or undersubscribe in a way that leaves torch
-    threads waiting on cores the OS won't schedule them onto.
-    """
-    torch.set_num_threads(max_cores)
-
-    if hasattr(os, "sched_setaffinity"):
-        try:
-            target_cores = set(range(max_cores))
-            os.sched_setaffinity(0, target_cores)
-        except Exception as exc:
-            print(f"[BUDGET] Could not set os.sched_setaffinity: {exc}")
-    else:
-        print(f"[BUDGET] os.sched_setaffinity not supported on {os.name} "
-              f"(fine on Windows/dev machines; required on the Pi5 target).")
-
-    verify_thread_budget(max_cores, context="startup")
-
-
-def verify_thread_budget(expected_cores: int, context: str = ""):
-    """
-    Read back the ACTUAL current thread count / affinity and log it, rather
-    than trusting that the earlier set_thread_budget() call stuck. Some
-    libraries (OpenCV's own internal thread pool in particular) have their
-    own separate thread settings that are not touched by torch.set_num_threads()
-    or os.sched_setaffinity() alone -- this makes any mismatch visible in the
-    console instead of silently causing contention.
-    """
-    actual_torch_threads = torch.get_num_threads()
-    if hasattr(os, "sched_getaffinity"):
-        actual_affinity = os.sched_getaffinity(0)
-    else:
-        actual_affinity = "n/a (platform doesn't support sched_getaffinity)"
-
-    try:
-        cv2_threads = cv2.getNumThreads()
-    except Exception:
-        cv2_threads = "unknown"
-
-    ok = (actual_torch_threads == expected_cores)
-    tag = "OK" if ok else "MISMATCH"
-    print(f"[BUDGET:{context}] torch_threads={actual_torch_threads} "
-          f"affinity={actual_affinity} cv2_threads={cv2_threads} "
-          f"expected={expected_cores} [{tag}]")
-    if cv2_threads != "unknown" and cv2_threads > expected_cores:
-        print(f"[BUDGET:{context}] WARNING: OpenCV's own thread pool "
-              f"({cv2_threads}) exceeds the intended budget ({expected_cores}). "
-              f"Consider calling cv2.setNumThreads({expected_cores}) explicitly.")
+from svlm_controller import SVLMController, build_telemetry_text
 
 
 # ============================================================
@@ -182,7 +87,10 @@ IOU_WEIGHT  = 0.4   # <-- contribution of IoU score (needs last_known_bbox)
 CMD_UDP_HOST             = "0.0.0.0"
 CMD_UDP_PORT             = 5000
 
-# Scan waypoints for 'scan' / 'survey' mission commands (pixel coords in sim)
+# SVLM master plan — activation altitude gate (Section 5)
+ALTITUDE_ACTIVATION_M = 3.0   # sim meters before camera/perception pipeline runs
+DETECTOR_GROUNDING = "grounding"
+DETECTOR_YOLO = "yolo"
 DEFAULT_SCAN_WAYPOINTS   = [
     (160, 120), (480, 120), (480, 360), (160, 360),  # rectangle survey pattern
 ]
@@ -240,6 +148,15 @@ def parse_args():
                              f"CPU affinity, kept in sync (default {DEFAULT_MAX_CORES}; "
                              f"set to your Pi5's reserved-core count in production, or "
                              f"higher on a dev laptop with no reservation needed).")
+    parser.add_argument("--detector", choices=[DETECTOR_YOLO, DETECTOR_GROUNDING],
+                        default=DETECTOR_YOLO,
+                        help="Detection backend: yolo (COCO) or grounding (open-vocabulary)")
+    parser.add_argument("--svlm-control", action="store_true",
+                        help="Use SmolVLM categorical control + execution layer for follow")
+    parser.add_argument("--activation-altitude", type=float, default=ALTITUDE_ACTIVATION_M,
+                        help="Sim altitude (m) before perception pipeline activates")
+    parser.add_argument("--skip-activation", action="store_true",
+                        help="Skip ARMED→CLIMBING gate (laptop dev — perception runs immediately)")
     args, _ = parser.parse_known_args()
     return args
 
@@ -346,15 +263,26 @@ class ThreadedCameraStream:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_size[0])
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_size[1])
 
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        actual_buf = self.cap.get(cv2.CAP_PROP_BUFFERSIZE)
         try:
             backend_name = self.cap.getBackendName()
         except AttributeError:
-            backend_name = "unknown (old OpenCV)"
+            backend_name = "unknown"
+
+        # Avoid setting CAP_PROP_BUFFERSIZE on MSMF backend on Windows (causes MF_E_INVALIDREQUEST -1072875772)
+        if backend_name != "MSMF":
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+        try:
+            actual_buf = self.cap.get(cv2.CAP_PROP_BUFFERSIZE)
+        except Exception:
+            actual_buf = 0.0
+
         print(f"[CAM] Backend: {backend_name}  "
               f"Requested BUFFERSIZE=1, read-back={actual_buf}  "
-              f"({'HONORED' if actual_buf == 1.0 else 'IGNORED by backend'})")
+              f"({'HONORED' if actual_buf == 1.0 else 'SKIPPED/IGNORED for backend'})")
         self.backend_name = backend_name
         self.buf_honored  = (actual_buf == 1.0)
 
@@ -379,14 +307,16 @@ class ThreadedCameraStream:
             self.thread.start()
 
     def _update_loop(self):
+        consecutive_failures = 0
         while not self.stopped:
             if not self.cap.isOpened():
-                time.sleep(0.01)
+                time.sleep(0.05)
                 continue
 
             _t0 = time.perf_counter()
             grabbed, frame = self.cap.read()
             if grabbed and frame is not None and frame.size > 0:
+                consecutive_failures = 0
                 if (frame.shape[1], frame.shape[0]) != self.target_size:
                     frame = cv2.resize(frame, self.target_size)
                 _dt_ms = (time.perf_counter() - _t0) * 1000.0
@@ -401,7 +331,9 @@ class ThreadedCameraStream:
                     self.latest_frame = frame
                     self.grabbed = grabbed
             else:
-                time.sleep(0.01)
+                consecutive_failures += 1
+                # Sleep longer on read failure to avoid high CPU spin and console log flooding
+                time.sleep(0.03 if consecutive_failures < 30 else 0.1)
 
     def read(self):
         with self.lock:
@@ -725,6 +657,12 @@ MISSION_SEARCH  = "search"
 MISSION_SCAN    = "scan"
 MISSION_RTL     = "rtl"
 
+# Altitude-gated activation (Section 5)
+ACT_ARMED            = "armed"
+ACT_CLIMBING         = "climbing"
+ACT_CAMERA_ACTIVE    = "camera_active"
+ACT_AWAITING_TARGET  = "awaiting_target"
+
 
 # ============================================================
 # MAIN ENGINE
@@ -735,16 +673,17 @@ def main():
 
     # --- Set the hard thread/core budget FIRST, before any torch/model work ---
     set_thread_budget(args.max_cores)
+    boost_main_thread_priority()
     print(f"[ENGINE] Hard thread/core budget: {args.max_cores} "
-          f"(torch intra-op threads AND OS CPU affinity both pinned to this value)")
+          f"(BLAS env + torch + OpenCV + OS affinity; set once at startup)")
 
     cam_source = select_camera(args)
     run_device = select_device(args)
 
     print("=" * 62)
-    print(" Drone Tracking Engine — Phase 1-6 + Optimized A/B/C/D/G/I + Pi5 budget")
-    print(f" Device: {run_device.upper()}  | Core budget: {args.max_cores} "
-          f"| YOLOv8n + Kalman + ORB-ReID + SmolVLM")
+    print(" Drone Tracking Engine — SVLM master plan + legacy YOLO pipeline")
+    print(f" Device: {run_device.upper()}  | Detector: {args.detector}  | "
+          f"SVLM control: {args.svlm_control}")
     print("=" * 62)
     print(" Keys: [q] quit  [l] lock target  [u] unlock  [h] hover  [s] search  [r] RTL  [p] timing HUD")
     print("=" * 62)
@@ -753,6 +692,7 @@ def main():
     from transformers import AutoProcessor
 
     try:
+        # pyrefly: ignore [missing-import]
         from transformers import AutoModelForImageTextToText as AutoVLMModel
     except ImportError:
         from transformers import AutoModelForVision2Seq as AutoVLMModel
@@ -766,16 +706,22 @@ def main():
     vlm_model.eval()
     print(f"[ENGINE] SmolVLM loaded on {run_device} ({model_dtype}). Sharing with ReID + Classifier.")
 
-    # shared_inference_lock ensures SmolVLM model.generate() is never called
-    # concurrently by cls_executor and reid_executor threads, AND makes the
-    # scoped thread-priority drop in each module's _low_priority_inference()
-    # safe (no other thread can be mid-inference while thread count changes).
+    # shared_inference_lock serialises SmolVLM generate() across cls/reid workers.
     shared_inference_lock = threading.Lock()
-    yolo_model  = YOLO(YOLO_MODEL_PATH)
+    yolo_model = None
+    grounding_engine = None
+    if args.detector == DETECTOR_GROUNDING:
+        grounding_engine = GroundingEngine(device=run_device)
+        print("[ENGINE] Open-vocabulary detector: Grounding DINO (lazy load on first query)")
+    else:
+        yolo_model = YOLO(YOLO_MODEL_PATH)
+        reapply_cv2_and_affinity(args.max_cores, context="post-yolo-load")
     reid        = ReIDEngine(shared_model=vlm_model, shared_processor=processor,
                              shared_inference_lock=shared_inference_lock)
     classifier  = SmolObjectClassifier(shared_model=vlm_model, shared_processor=processor,
                                        shared_inference_lock=shared_inference_lock)
+    svlm_ctrl   = SVLMController(vlm_model, processor, shared_inference_lock) if args.svlm_control else None
+    exec_layer  = ExecutionLayer() if args.svlm_control else None
     drone       = Sim2DDroneController(world_size=(FRAME_WIDTH, FRAME_HEIGHT))
     cmd_recv    = CommandReceiver()
 
@@ -787,6 +733,39 @@ def main():
         print("Please check your camera index or IP network connection.")
         return
 
+    # --- Wait for first real frame (camera drivers can take 1-3s to init) ---
+    print("[ENGINE] Waiting for camera to deliver first frame...")
+    _cam_wait_start = time.time()
+    _cam_wait_timeout = 5.0  # seconds before giving up
+    while True:
+        _ret, _first_frame = cap.read()
+        if _ret and _first_frame is not None:
+            break
+        if time.time() - _cam_wait_start > _cam_wait_timeout:
+            print(f"[ERROR] Camera did not deliver a frame within {_cam_wait_timeout:.0f}s. Check camera index/URL.")
+            cap.release()
+            return
+        time.sleep(0.05)
+    print(f"[ENGINE] First frame received in {(time.time()-_cam_wait_start)*1000:.0f}ms.")
+
+    # --- YOLO warmup: prime PyTorch JIT kernel cache before the main loop ---
+    # The first model.predict() call compiles CUDA/CPU kernels and can stall
+    # for 2-5 seconds on both devices, freezing the window on the first live frame.
+    # Running a warmup pass on a blank frame eliminates this visible freeze.
+    print("[ENGINE] YOLO warmup pass (priming PyTorch kernel cache)...")
+    _warmup_frame = _first_frame.copy()
+    _t_warmup = time.perf_counter()
+    try:
+        if yolo_model is not None:
+            yolo_model.predict(source=_warmup_frame, verbose=False,
+                               conf=DETECTION_CONFIDENCE_SEARCH, device=run_device, imgsz=YOLO_IMGSZ)
+        elif grounding_engine is not None:
+            grounding_engine.ground_to_candidates(_warmup_frame, "person", top_k=1)
+    except Exception as _warmup_exc:
+        print(f"[ENGINE] Warmup predict raised (non-fatal): {_warmup_exc}")
+    print(f"[ENGINE] Warmup done in {(time.perf_counter()-_t_warmup)*1000:.0f}ms — main loop starting.")
+    del _warmup_frame
+
     tracker           = None
     locked            = False
     mission_state     = MISSION_SEARCH
@@ -794,13 +773,21 @@ def main():
     reid_status       = ""
     frame_count       = 0
     current_target_class = TARGET_CLASS_NAME
+    current_grounding_phrase = TARGET_CLASS_NAME
     last_known_bbox   = None
+    activation_phase  = ACT_CAMERA_ACTIVE if args.skip_activation else ACT_ARMED
 
-    cls_executor  = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    reid_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    cls_executor  = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, initializer=set_background_thread_priority)
+    reid_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, initializer=set_background_thread_priority)
+    ctrl_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, initializer=set_background_thread_priority) if args.svlm_control else None
     classification_future = None
     reid_future           = None
+    svlm_ctrl_future      = None
     vlm_spatial_cache     = []
+    candidates            = []  # initialised here so first-frame frame-skip never hits NameError
 
     CLASSIFY_COOLDOWN_SEC = 5.0
     last_cls_submit_time  = 0.0
@@ -834,10 +821,38 @@ def main():
 
         with t_cam_read:
             ret, frame = cap.read()
-        if not ret:
-            print("[ERROR] Failed to read frame.")
-            break
+        if not ret or frame is None:
+            # Under high CPU load (2-core affinity) the camera thread may occasionally
+            # miss a frame. Skip this iteration rather than breaking the whole loop.
+            time.sleep(0.005)
+            continue
         frame_count += 1
+
+        # ---- 0. Altitude-gated activation state machine (Section 5) ----
+        if not args.skip_activation:
+            st = drone.get_state()
+            alt = st.get("altitude_m", 0.0)
+            if activation_phase == ACT_ARMED:
+                activation_phase = ACT_CLIMBING
+                drone.set_altitude_target(args.activation_altitude)
+                status_text = f"Climbing to {args.activation_altitude:.1f}m ..."
+            elif activation_phase == ACT_CLIMBING:
+                if alt >= args.activation_altitude - 0.05:
+                    activation_phase = ACT_CAMERA_ACTIVE
+                    status_text = "Camera active — awaiting target"
+                else:
+                    drone.step_physics()
+                    # skip perception until climb complete
+                    cv2.imshow("Drone Tracking Engine", frame)
+                    if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                        break
+                    continue
+            elif activation_phase == ACT_CAMERA_ACTIVE:
+                activation_phase = ACT_AWAITING_TARGET
+
+        perception_active = args.skip_activation or activation_phase in (
+            ACT_CAMERA_ACTIVE, ACT_AWAITING_TARGET
+        )
 
         # ---- 1. Process any queued voice/text commands ----
         while not cmd_recv.queue.empty():
@@ -845,6 +860,12 @@ def main():
             action = cmd.get("action", "hover")
             target_desc = cmd.get("target")
             coco_class = cmd.get("coco_class")
+            grounding_phrase = cmd.get("grounding_phrase") or target_desc
+            directions = cmd.get("directions") or []
+            target_altitude_m = cmd.get("target_altitude_m")
+
+            if exec_layer is not None and action in ("hover", "stop", "rtl", "return", "land"):
+                exec_layer.trigger_manual_override()
 
             if action in ("hover", "stop"):
                 mission_state = MISSION_HOVER
@@ -853,14 +874,32 @@ def main():
 
             elif action in ("follow", "track"):
                 mission_state = MISSION_FOLLOW
+                if grounding_phrase:
+                    current_grounding_phrase = grounding_phrase
                 if coco_class:
                     current_target_class = coco_class
 
                 if target_desc:
                     reid.target_tag = target_desc.lower()
-                    status_text = f"[CMD] Following {current_target_class}: '{target_desc}'"
+                    status_text = f"[CMD] Following: '{target_desc}'"
                 else:
-                    status_text = f"[CMD] Following {current_target_class} (re-lock on next detection)"
+                    status_text = f"[CMD] Following {current_grounding_phrase} (re-lock on next detection)"
+
+            elif directions and exec_layer is not None:
+                from svlm_controller import ControlDecision
+                h, v = "center", "center"
+                for d in directions:
+                    if d in ("left", "right"):
+                        h = d
+                    if d in ("up", "down", "forward", "backward"):
+                        v = "up" if d in ("up", "forward") else ("down" if d in ("down", "backward") else v)
+                spd = cmd.get("speed", "medium")
+                urg = {"slow": "gentle", "medium": "moderate", "fast": "aggressive"}.get(spd, "moderate")
+                exec_layer.set_decision(ControlDecision(
+                    target_visible=True, horizontal=h, vertical=v, urgency=urg, confidence="high",
+                ))
+                exec_layer.clear_manual_override()
+                status_text = f"[CMD] Compound move {directions} @ {spd}"
 
             elif action == "search":
                 mission_state = MISSION_SEARCH
@@ -878,6 +917,11 @@ def main():
                 drone.return_to_launch()
                 status_text = "[CMD] Returning to launch"
 
+            if target_altitude_m is not None:
+                drone.set_altitude_target(float(target_altitude_m))
+                if activation_phase == ACT_ARMED:
+                    activation_phase = ACT_CLIMBING
+
             print(f"[ENGINE] Mission → {mission_state}  |  {status_text}")
 
         # ---- 2. Frame-skip + ROI/tiled/full detection ----
@@ -885,8 +929,21 @@ def main():
             stable_track = locked and tracker is not None and tracker.frames_since_update < 5
             skip_n = DETECT_EVERY_N_FRAMES_LOCKED if stable_track else DETECT_EVERY_N_FRAMES
 
-            if frame_count % skip_n == 0:
-                if stable_track and tracker is not None:
+            if perception_active and frame_count % skip_n == 0:
+                if grounding_engine is not None:
+                    phrase = current_grounding_phrase or reid.target_tag or current_target_class
+                    raw_ground = grounding_engine.ground_to_candidates(
+                        frame, phrase, top_k=3,
+                    )
+                    if raw_ground and mission_state == MISSION_FOLLOW and not locked:
+                        best_g = pick_best_grounded_candidate(
+                            raw_ground, frame, phrase, grounding_engine,
+                            vlm_model, processor, shared_inference_lock, crop_fn=crop_bbox,
+                        )
+                        candidates = [best_g] if best_g else raw_ground
+                    else:
+                        candidates = raw_ground
+                elif stable_track and tracker is not None:
                     predicted_xy = tracker.get_position()
                     candidates = detect_in_roi(
                         yolo_model, frame, predicted_xy, ROI_PAD_PX,
@@ -923,6 +980,14 @@ def main():
                     is_match, similarity, _ = res
                     if not is_match:
                         reid_status = f"⚠ ID switch? sim={similarity:.3f}"
+                        # Re-ground on ID switch when using grounding backend
+                        if grounding_engine is not None and locked:
+                            phrase = current_grounding_phrase or reid.target_tag or ""
+                            if phrase:
+                                reground = grounding_engine.ground_to_candidates(frame, phrase, top_k=1)
+                                if reground:
+                                    candidates = reground
+                                    status_text = "Re-grounding after ID switch"
                     else:
                         reid_status = f"✓ ReID sim={similarity:.3f}"
                 elif isinstance(res, str):
@@ -974,6 +1039,25 @@ def main():
             status_text = f"Auto-locked {current_target_class} — following"
             print(f"[ENGINE] Auto-locked target ({current_target_class}).")
 
+        # ---- SVLM control decision (async, Section 3) ----
+        if svlm_ctrl and exec_layer and perception_active and locked and tracker is not None:
+            res, done = _reap_future(svlm_ctrl_future)
+            if done:
+                svlm_ctrl_future = None
+                if res is not None:
+                    exec_layer.set_decision(res)
+            if svlm_ctrl_future is None and svlm_ctrl.should_decide_now():
+                tx, ty = tracker.get_position()
+                telem = build_telemetry_text(
+                    drone.get_state(), target_center=(tx, ty),
+                    frame_size=(FRAME_WIDTH, FRAME_HEIGHT), locked=True,
+                )
+                crop = crop_bbox(frame, last_known_bbox) if last_known_bbox else None
+                target_desc = reid.target_tag or current_grounding_phrase
+                svlm_ctrl_future = ctrl_executor.submit(
+                    svlm_ctrl.decide, frame.copy(), target_desc, telem, crop,
+                )
+
         # ---- 4. Tracking + re-ID (only when a target is locked) ----
         with t_kf:
             if locked and tracker is not None and mission_state == MISSION_FOLLOW:
@@ -1006,6 +1090,9 @@ def main():
                 elif tracker.is_stopped():
                     drone.hold_position()
                     status_text += " | stopped → holding"
+                elif exec_layer is not None and args.svlm_control:
+                    svlm_status = exec_layer.apply(drone, (FRAME_WIDTH, FRAME_HEIGHT))
+                    status_text += f" | {svlm_status}"
                 else:
                     tx, ty = tracker.get_position()
                     vx, vy = tracker.get_velocity()
@@ -1069,10 +1156,9 @@ def main():
             _csv_rows.clear()
             _csv_last_dump = _now
 
-        # Periodic budget-drift check — catches any library silently
-        # re-claiming threads/cores mid-run (rare, but worth surfacing).
+        # Periodic read-only drift check — re-pin only if something changed mid-run.
         if _now - _budget_last_check >= BUDGET_VERIFY_INTERVAL_SEC:
-            verify_thread_budget(args.max_cores, context="runtime")
+            repair_thread_budget_if_drifted(args.max_cores, context="runtime")
             _budget_last_check = _now
 
         if key == ord('q'):
@@ -1113,6 +1199,8 @@ def main():
         elif key == ord('h'):
             drone.hold_position()
             mission_state = MISSION_HOVER
+            if exec_layer:
+                exec_layer.trigger_manual_override()
             status_text   = "[KEY] Hovering"
 
         elif key == ord('s'):
@@ -1124,6 +1212,8 @@ def main():
         elif key == ord('r'):
             drone.return_to_launch()
             mission_state = MISSION_RTL
+            if exec_layer:
+                exec_layer.trigger_manual_override()
             status_text   = "[KEY] Returning to launch"
 
         elif key == ord('p'):
@@ -1134,6 +1224,8 @@ def main():
     cv2.destroyAllWindows()
     cls_executor.shutdown(wait=False)
     reid_executor.shutdown(wait=False)
+    if ctrl_executor:
+        ctrl_executor.shutdown(wait=False)
 
 
 # ============================================================
@@ -1194,6 +1286,9 @@ def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
     _text(fps_str, 22, color=(0, 255, 120), x=w - fps_w - 15)
 
     _text(f"Mission: {mission.upper()}  |  Drone: {state['status']}  |  {cam_str}", 44, mission_color)
+    alt = state.get("altitude_m")
+    if alt is not None:
+        _text(f"Alt: {alt:.1f}m (tgt {state.get('target_altitude_m', 0):.1f}m)", 66, (200, 200, 120))
     if reid_status:
         _text(reid_status, 66, (180, 220, 255))
 
@@ -1204,11 +1299,10 @@ def _draw_overlay(frame, candidates, tracker, locked, drone, status_text,
         cv2.rectangle(frame, (8, h - 25 - lbl_h - 4), (12 + lbl_w, h - 25 + baseline), (180, 180, 180), 1)
         cv2.putText(frame, lbl_str, (10, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
-    # NOTE: torch.get_num_threads() here reflects the MAIN THREAD's view of the
-    # process-wide setting. It will read as `max_cores` most of the time, but
-    # will briefly read as 1 (VLM_LOW_PRIORITY_THREADS) during the exact window
-    # a background VLM call is executing its scoped low-priority section --
-    # that's expected and not a bug; it's the fix working as intended.
+    # torch.get_num_threads() reflects the process-wide pool size set once at startup
+    # by thread_budget.set_thread_budget(). It should remain constant at max_cores
+    # for the full process lifetime — VLMThreadLimiter was removed (see CHANGELOG);
+    # background VLM workers now use OS thread priority instead of pool toggling.
     active_threads = torch.get_num_threads()
     total_cores = os.cpu_count() or 4
     if device == "cpu":

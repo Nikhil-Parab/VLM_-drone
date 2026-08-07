@@ -1,28 +1,12 @@
 """
-small_object_classifier.py
-===========================
-SmolVLM-based classifier for small or low-confidence YOLO detections.
+small_object_classifier.py — SmolVLM description for small/uncertain
+YOLO detections (box area < SMALL_OBJECT_AREA_PX or conf < threshold).
 
-When YOLOv8n gives us a bounding box that is tiny (< SMALL_OBJECT_AREA_PX²)
-or its class confidence is shaky (< SMALL_OBJECT_CONF_THRESH), we don't
-trust the generic COCO label. Instead we send the crop to SmolVLM-256M for
-a richer, contextual description — e.g. "silver sedan, dented rear" vs. just
-"car" — which then feeds directly into the re-ID tag comparison.
-
-Design decisions:
-  • Shared model instance: pass your already-loaded SmolVLM model + processor
-    from ReIDEngine to avoid loading the model twice (~987MB on disk each load).
-    If you pass None, it loads its own copy (handy for standalone testing).
-  • Per-track cooldown: classify_if_small() remembers the last time it ran
-    for each track_id and skips if within CLASSIFY_COOLDOWN_SEC. This stops
-    hammering VLM on the same tiny box every frame.
-  • Thread-safe: a threading.Lock guards model inference so this can be called
-    from a camera thread while reid_engine runs on another.
-
-Typical call in the tracking loop:
-    label = classifier.classify_if_small(crop, bbox, conf, track_id=track_id)
-    if label:
-        candidate["vlm_label"] = label  # richer than YOLO's generic class
+Pass shared_model/shared_processor to reuse the SmolVLM instance from
+ReIDEngine (skips a second ~987MB load). Pass shared_inference_lock
+(shared with ReIDEngine) so classify() and generate_hud_label() never
+run model.generate() concurrently - without it, both callers contend
+for the same model object and starve the main loop.
 """
 
 import threading
@@ -31,10 +15,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-
-# Phase B: cap intra-op threads — leaves cores for camera/main loop
-torch.set_num_threads(2)
+import cv2
 from PIL import Image
+
+# Thread budget is set once by drone_tracking_engine.set_thread_budget() — do not override here.
 
 try:
     from transformers import AutoModelForImageTextToText as AutoVLMModel
@@ -48,6 +32,7 @@ from transformers import AutoProcessor
 # ============================================================
 
 SMOLVLM_MODEL_ID       = "HuggingFaceTB/SmolVLM-256M-Instruct"
+DEBUG = False  # <-- SET True to re-enable per-call VLM timing/frequency logs if lag reappears
 
 SMALL_OBJECT_AREA_PX   = 64 * 64    # px²  -- boxes smaller than this get classified
 SMALL_OBJECT_CONF_THRESH = 0.55     # YOLO confidence -- below this also triggers VLM
@@ -111,11 +96,8 @@ class SmolObjectClassifier:
             self.model.eval()
             print(f"[SmolObjectClassifier] Loaded on {self.device}.")
 
-        # Per-track cooldown tracking: {track_id: timestamp_float}
         self._last_classified = {}
-        # H1 diagnosis: call counter
-        self._call_count = 0
-        self._last_wall = 0.0
+        self._call_count = 0    # only used/incremented when DEBUG=True
 
     def classify(self, crop_bgr: np.ndarray) -> str:
         """
@@ -129,16 +111,9 @@ class SmolObjectClassifier:
         if min(h, w) < MIN_CROP_DIM:
             return "too small to classify"
 
-        # H1 diagnosis: log every call so frequency is visible in console
-        self._call_count += 1
-        call_n = self._call_count
-        now_wall = time.time()
-        gap = now_wall - self._last_wall if self._last_wall > 0 else -1.0
-        self._last_wall = now_wall
-        if gap >= 0:
-            print(f"[CLASSIFY] call #{call_n} start  wall={now_wall:.3f}  gap_from_prev={gap:.2f}s")
-        else:
-            print(f"[CLASSIFY] call #{call_n} start  wall={now_wall:.3f}  (first call)")
+        if DEBUG:
+            self._call_count += 1
+            print(f"[CLASSIFY] call #{self._call_count}")
         _t0 = time.perf_counter()
 
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
@@ -148,21 +123,16 @@ class SmolObjectClassifier:
         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
         inputs = self.processor(text=prompt, images=[image], return_tensors="pt").to(self.device)
 
-        # H1+H2 fix + Test 1b: VLMThreadLimiter constrains VLM generate() to 1 thread on CPU
-        # so YOLO and main loop keep full CPU thread budget.
         with self._inference_lock:
             with torch.no_grad():
-                with VLMThreadLimiter(1):
-                    threads_in_vlm = torch.get_num_threads()
-                    print(f"[DIAG 1b] VLM classify generate() running with scoped torch threads={threads_in_vlm}")
-                    generated_ids = self.model.generate(
-                        **inputs,
-                        max_new_tokens=12,        # Phase B: was 20; 6-word desc fits in 12 tokens
-                        do_sample=False,          # greedy — faster, more consistent labels
-                    )
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=12,        # Phase B: was 20; 6-word desc fits in 12 tokens
+                    do_sample=False,          # greedy — faster, more consistent labels
+                )
 
-        dt = time.perf_counter() - _t0
-        print(f"[CLASSIFY] call #{call_n} done   dt={dt:.2f}s")
+        if DEBUG:
+            print(f"[CLASSIFY] done  dt={time.perf_counter()-_t0:.2f}s")
 
         new_ids = generated_ids[0][inputs["input_ids"].shape[1]:]
         decoded = self.processor.decode(new_ids, skip_special_tokens=True)
@@ -237,8 +207,6 @@ class SmolObjectClassifier:
 # ============================================================
 
 if __name__ == "__main__":
-    import cv2  # noqa: F401 — only needed for the demo
-
     print("=== SmolObjectClassifier smoke-test ===")
     classifier = SmolObjectClassifier()  # loads its own model copy
 

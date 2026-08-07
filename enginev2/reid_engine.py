@@ -1,23 +1,15 @@
 """
-reid_engine.py
-===============
-Periodic re-identification layer — Phase A/B/C optimized.
+reid_engine.py — periodic re-identification layer.
 
-Architecture:
-  - Phase C: ReID now uses ORB feature descriptors + HSV color histogram for
-    embedding-based similarity (~5ms CPU) instead of SmolVLM text-tag Jaccard
-    matching (~10s CPU). REID_INTERVAL_SEC drops from 8s → 0.5s — can now
-    run frequently without blocking anything.
-  - Phase B: generate_tag() still exists for HUD human-readable labels but
-    is now greedy (do_sample=False) and trimmed to max_new_tokens=15.
-  - torch.set_num_threads(2) caps intra-op threads to leave cores for the
-    main tracking loop / camera thread.
+Primary path: ORB descriptors + HSV histogram embedding (~5ms CPU),
+checked every REID_INTERVAL_SEC. SmolVLM is only used for the optional
+human-readable HUD label (generate_hud_label), on its own long cooldown
+(HUD_LABEL_INTERVAL_SEC) - never in the per-frame verify() path.
 
-Shared-model support (Phase 5/6):
-  Pass shared_model and shared_processor to __init__ to reuse the
-  SmolVLM instance loaded in drone_tracking_engine.py. This saves ~987 MB
-  of RAM. SmolVLM is now only called for HUD label generation (rare, async),
-  never for frame-to-frame ReID decisions.
+Pass shared_model/shared_processor from drone_tracking_engine.py to reuse
+one SmolVLM instance instead of loading a second copy (~987MB saved).
+Pass shared_inference_lock (shared with SmolObjectClassifier) so the two
+never call model.generate() concurrently. Full phase history: CHANGELOG.md.
 """
 
 import re
@@ -35,10 +27,10 @@ try:
 except ImportError:
     from transformers import AutoModelForVision2Seq as AutoVLMModel
 
-# Phase B: cap intra-op threads — leave cores for camera/main loop
-torch.set_num_threads(2)
+# Thread budget is set once by drone_tracking_engine.set_thread_budget() — do not override here.
 
 MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct"  # <-- CHANGE VLM MODEL HERE
+DEBUG = False  # <-- SET True to re-enable per-call VLM timing/frequency logs if lag reappears
 
 # PSTG-style prompt: only used for HUD label generation now (not ReID decisions)
 REID_PROMPT = (
@@ -147,21 +139,6 @@ def _extract_reid_tag(raw_text: str) -> str:
     return raw_text.strip().lower()
 
 
-class VLMThreadLimiter:
-    """Temporarily constrains PyTorch intra-op threads to target_threads during VLM generate()."""
-    def __init__(self, target_threads: int = 1):
-        self.target_threads = target_threads
-        self.prev_threads = 1
-
-    def __enter__(self):
-        self.prev_threads = torch.get_num_threads()
-        torch.set_num_threads(self.target_threads)
-        return self
-
-    def __exit__(self, *args):
-        torch.set_num_threads(self.prev_threads)
-
-
 class ReIDEngine:
     def __init__(self, model_id=MODEL_ID, shared_model=None, shared_processor=None,
                  shared_inference_lock=None):
@@ -200,9 +177,7 @@ class ReIDEngine:
 
         # H2 fix: separate cadence for HUD label generation (SmolVLM) vs verify (ORB)
         self.last_hud_label_time: float = 0.0
-        # H2 diagnosis: call counter
-        self._hud_call_count: int = 0
-        self._hud_last_wall: float = 0.0
+        self._hud_call_count: int = 0    # only used/incremented when DEBUG=True
 
     # ------------------------------------------------------------------
     # Phase C: Embedding-based ReID (primary — fast, ~5ms)
@@ -269,17 +244,10 @@ class ReIDEngine:
           - Uses shared_inference_lock to prevent concurrent execution with classify().
           - Logs call number, wall time, duration, gap from previous call.
         """
-        # H2 diagnosis: log every call so frequency is visible in console
-        self._hud_call_count += 1
-        call_n = self._hud_call_count
-        now_wall = time.time()
-        gap = now_wall - self._hud_last_wall if self._hud_last_wall > 0 else -1.0
-        self._hud_last_wall = now_wall
-        self.last_hud_label_time = now_wall   # record so should_generate_hud_now() gates future calls
-        if gap >= 0:
-            print(f"[HUD_LABEL] call #{call_n} start  wall={now_wall:.3f}  gap_from_prev={gap:.2f}s")
-        else:
-            print(f"[HUD_LABEL] call #{call_n} start  wall={now_wall:.3f}  (first call)")
+        if DEBUG:
+            self._hud_call_count += 1
+            print(f"[HUD_LABEL] call #{self._hud_call_count}  gap={time.time()-self.last_hud_label_time:.2f}s")
+        self.last_hud_label_time = time.time()
         _t0 = time.perf_counter()
 
         rgb = cv2.cvtColor(cropped_frame_bgr, cv2.COLOR_BGR2RGB)
@@ -289,20 +257,18 @@ class ReIDEngine:
         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
         inputs = self.processor(text=prompt, images=[image], return_tensors="pt").to(self.device)
 
-        # H2 fix: shared lock ensures classify() and generate_hud_label() never overlap
+        # shared lock ensures classify() and generate_hud_label() never overlap
         with self._inference_lock:
             with torch.no_grad():
-                with VLMThreadLimiter(1):
-                    threads_in_hud = torch.get_num_threads()
-                    print(f"[DIAG 1b] VLM generate_hud_label scoped to torch threads={threads_in_hud}")
-                    generated_ids = self.model.generate(
-                        **inputs,
-                        max_new_tokens=15,
-                        do_sample=False,
-                    )
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=15,
+                    do_sample=False,
+                )
 
         dt = time.perf_counter() - _t0
-        print(f"[HUD_LABEL] call #{call_n} done   dt={dt:.2f}s")
+        if DEBUG:
+            print(f"[HUD_LABEL] done  dt={dt:.2f}s")
 
         new_ids = generated_ids[0][inputs["input_ids"].shape[1]:]
         decoded = self.processor.decode(new_ids, skip_special_tokens=True)
