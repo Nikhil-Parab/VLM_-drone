@@ -280,10 +280,6 @@ class ReIDEngine:
         self.target_tag = tag
         return tag
 
-    # Backwards-compat alias used by drone_tracking_engine.py
-    def generate_tag(self, cropped_frame_bgr: np.ndarray) -> str:
-        return self.generate_hud_label(cropped_frame_bgr)
-
 
 # ------------------------------------------------------------------
 # UPGRADE PATH NOTE:

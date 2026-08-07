@@ -1,5 +1,10 @@
 import sys
-sys.path.insert(0, '.')
+import os
+
+_ENGINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ENGINE not in sys.path:
+    sys.path.insert(0, _ENGINE)
+
 
 from voice_command_interface import ACTION_SYNONYMS, VALID_ACTIONS
 

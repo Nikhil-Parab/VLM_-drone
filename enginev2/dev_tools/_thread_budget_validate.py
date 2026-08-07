@@ -73,8 +73,9 @@ class TestThreadBudgetGuard(unittest.TestCase):
                 with patch("torch.set_num_threads") as mock_set:
                     with patch.object(thread_budget, "verify_thread_budget"):
                         repaired = thread_budget.repair_thread_budget_if_drifted(2, context="test-torch-drift")
-                        self.assertTrue(repaired, "torch drift should be repaired to maintain budget")
-                        mock_set.assert_called_once_with(2)
+                        self.assertTrue(repaired, "torch drift should trigger warning without set_num_threads call")
+                        mock_set.assert_not_called()  # torch.set_num_threads is intentionally NOT called mid-run
+
 
         # Drift in cv2 or affinity — those CAN safely be repaired mid-run.
         drift_state_cv2 = {
