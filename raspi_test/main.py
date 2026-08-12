@@ -14,6 +14,10 @@ user_site = os.path.expanduser("~/.local/lib/python3.13/site-packages")
 if user_site not in sys.path and os.path.exists(user_site):
     sys.path.append(user_site)
 
+for sys_dist in ["/usr/lib/python3/dist-packages", "/usr/local/lib/python3/dist-packages"]:
+    if sys_dist not in sys.path and os.path.exists(sys_dist):
+        sys.path.append(sys_dist)
+
 import time
 import threading
 import logging

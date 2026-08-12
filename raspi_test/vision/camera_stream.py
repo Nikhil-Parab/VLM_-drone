@@ -30,24 +30,49 @@ class CameraStream:
 
     def _init_camera(self):
         if self.use_picamera2:
+            Picamera2 = None
             try:
                 from picamera2 import Picamera2
-                logger.info("Initializing Picamera2 driver for Raspberry Pi Camera...")
-                self.picam2 = Picamera2()
-                config = self.picam2.create_preview_configuration(
-                    main={"size": (self.width, self.height), "format": "RGB888"}
-                )
-                self.picam2.configure(config)
-                self.picam2.start()
-                # Verify frame read
-                time.sleep(0.2)
-                test_arr = self.picam2.capture_array()
-                if test_arr is not None:
-                    self.mode = "picamera2"
-                    logger.info("Picamera2 started successfully in true-color mode.")
-                    return
-            except Exception as e:
-                logger.warning(f"Picamera2 initialization failed: {e}. Falling back to OpenCV/V4L2 hardware search.")
+            except ImportError:
+                sys_dist_paths = [
+                    "/usr/lib/python3/dist-packages",
+                    "/usr/lib/python3.11/dist-packages",
+                    "/usr/lib/python3.12/dist-packages",
+                    "/usr/lib/python3.13/dist-packages",
+                    "/usr/local/lib/python3/dist-packages",
+                ]
+                for p in sys_dist_paths:
+                    if p not in sys.path and os.path.exists(p):
+                        sys.path.append(p)
+                try:
+                    from picamera2 import Picamera2
+                except ImportError:
+                    Picamera2 = None
+
+            if Picamera2 is not None:
+                try:
+                    logger.info("Initializing Picamera2 driver for Raspberry Pi Camera (IMX708)...")
+                    self.picam2 = Picamera2()
+                    try:
+                        config = self.picam2.create_video_configuration(
+                            main={"size": (self.width, self.height), "format": "RGB888"}
+                        )
+                    except Exception:
+                        config = self.picam2.create_preview_configuration(
+                            main={"size": (self.width, self.height), "format": "RGB888"}
+                        )
+                    self.picam2.configure(config)
+                    self.picam2.start()
+                    time.sleep(0.3)
+                    test_arr = self.picam2.capture_array()
+                    if test_arr is not None and test_arr.size > 0:
+                        self.mode = "picamera2"
+                        logger.info("Picamera2 started successfully in RGB888 true-color mode.")
+                        return
+                except Exception as e:
+                    logger.warning(f"Picamera2 configuration/start failed: {e}. Falling back to OpenCV/V4L2 hardware search.")
+            else:
+                logger.warning("Picamera2 package not found in Python environment or system dist-packages.")
 
         # Candidate V4L2 video devices to check
         configured_dev = self.config.get("v4l2_device", 0)
