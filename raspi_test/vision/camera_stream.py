@@ -29,42 +29,57 @@ class CameraStream:
         self._init_camera()
 
     def _init_camera(self):
-
         if self.use_picamera2:
             try:
                 from picamera2 import Picamera2
-                logger.info("Initializing Picamera2 driver for NoIR Pi Camera Module 3...")
+                logger.info("Initializing Picamera2 driver for Raspberry Pi Camera...")
                 self.picam2 = Picamera2()
                 config = self.picam2.create_preview_configuration(
                     main={"size": (self.width, self.height), "format": "RGB888"}
                 )
                 self.picam2.configure(config)
                 self.picam2.start()
-                self.mode = "picamera2"
-                logger.info("Picamera2 started successfully in RGB888 -> BGR true-color mode.")
-                return
-            except Exception as e:
-                logger.warning(f"Picamera2 initialization failed: {e}. Falling back to V4L2 OpenCV.")
-
-
-        try:
-            device_idx = self.config.get("v4l2_device", 0)
-            self.cap = cv2.VideoCapture(device_idx, cv2.CAP_V4L2)
-            if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    self.mode = "v4l2"
-                    logger.info(f"OpenCV V4L2 Camera initialized on /dev/video{device_idx}")
+                # Verify frame read
+                time.sleep(0.2)
+                test_arr = self.picam2.capture_array()
+                if test_arr is not None:
+                    self.mode = "picamera2"
+                    logger.info("Picamera2 started successfully in true-color mode.")
                     return
-        except Exception as e:
-            logger.warning(f"V4L2 VideoCapture failed: {e}")
+            except Exception as e:
+                logger.warning(f"Picamera2 initialization failed: {e}. Falling back to OpenCV/V4L2 hardware search.")
 
+        # Candidate V4L2 video devices to check
+        configured_dev = self.config.get("v4l2_device", 0)
+        candidate_devs = [configured_dev]
+        for d in [0, 1, 2, 4, 10, 11, -1]:
+            if d not in candidate_devs:
+                candidate_devs.append(d)
 
-        logger.info("Operating in Synthetic Test Camera Mode (Simulated Sky-High Flight Feed).")
+        for dev_idx in candidate_devs:
+            for backend in [cv2.CAP_V4L2, cv2.CAP_ANY]:
+                try:
+                    cap = cv2.VideoCapture(dev_idx, backend)
+                    if cap.isOpened():
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                        cap.set(cv2.CAP_PROP_FPS, self.fps)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                        # Warmup retry loop (allow camera hardware buffer time to warm up)
+                        for _ in range(15):
+                            ret, frame = cap.read()
+                            if ret and frame is not None and frame.size > 0:
+                                self.cap = cap
+                                self.mode = "v4l2"
+                                logger.info(f"Physical camera initialized on /dev/video{dev_idx} (backend={backend})")
+                                return
+                            time.sleep(0.05)
+                        cap.release()
+                except Exception as e:
+                    logger.debug(f"VideoCapture attempt failed on /dev/video{dev_idx} (backend={backend}): {e}")
+
+        logger.warning("No active hardware camera (Picamera2 or OpenCV /dev/video*) detected. Falling back to Synthetic Simulated Camera Feed.")
         self.mode = "simulated"
         self._sim_t = 0.0
 
@@ -95,7 +110,6 @@ class CameraStream:
             try:
                 array = self.picam2.capture_array()
                 if array is not None:
-
                     if len(array.shape) == 3:
                         if array.shape[2] == 4:
                             return cv2.cvtColor(array, cv2.COLOR_RGBA2BGR)
@@ -106,12 +120,22 @@ class CameraStream:
                 logger.error(f"Picamera2 capture error: {e}")
 
         elif self.mode == "v4l2":
-            try:
-                ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    return frame
-            except Exception as e:
-                logger.error(f"V4L2 read error: {e}")
+            if self.cap and self.cap.isOpened():
+                try:
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None and frame.size > 0:
+                        return frame
+                    # Retry once on transient dropped frame
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None and frame.size > 0:
+                        return frame
+                except Exception as e:
+                    logger.error(f"V4L2 read error: {e}")
+            
+            # Return last valid frame if available instead of falling back to synthetic frame
+            with self.lock:
+                if self.frame is not None:
+                    return self.frame
 
         return self._generate_simulated_frame()
 
