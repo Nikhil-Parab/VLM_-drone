@@ -294,7 +294,7 @@ class MissionEngine:
 
     def dispatch_voice_phrase(self, phrase):
         cmd = self.voice_engine.process_voice_phrase(phrase)
-        return cmd
+        return self.execute_mission_command(cmd)
 
     def execute_mission_command(self, cmd):
         action = cmd.get("action")
@@ -338,7 +338,14 @@ class MissionEngine:
             alt = params.get("alt", 10.0)
             self.drone.send_velocity_target(1.0, 1.0, 0.0)
 
-        return {"action": action, "params": params, "drone_mode": self.drone.state["mode"]}
+        return {
+            "action": action,
+            "params": params,
+            "drone_mode": self.drone.state["mode"],
+            "target": self.search_target,
+            "color": self.search_color,
+            "text": self.search_text
+        }
 
     def stop(self):
         self.running = False

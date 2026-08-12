@@ -61,7 +61,16 @@ def create_app(mission_engine=None):
         logger.info(f"GCS Web Received Command: '{text}'")
         if mission_engine:
             res = mission_engine.dispatch_command_text(text)
-            return jsonify({"status": "ok", "message": f"Executed {res.get('action')}", "details": res})
+            action = res.get('action', 'UNKNOWN')
+            details_str = action
+            if res.get('target'):
+                details_str += f" (target: {res.get('target')}"
+                if res.get('text'):
+                    details_str += f", text: {res.get('text')}"
+                if res.get('color'):
+                    details_str += f", color: {res.get('color')}"
+                details_str += ")"
+            return jsonify({"status": "ok", "message": f"Executed {details_str}", "details": res})
         return jsonify({"status": "ok", "message": "Command logged (Engine Standby)"})
 
     @app.route("/api/voice_command", methods=["POST"])
@@ -74,7 +83,16 @@ def create_app(mission_engine=None):
         logger.info(f"GCS Web Received Voice Command Phrase: '{phrase}'")
         if mission_engine:
             res = mission_engine.dispatch_voice_phrase(phrase)
-            return jsonify({"status": "ok", "message": f"Voice Action: {res.get('action')}", "details": res})
+            action = res.get('action', 'UNKNOWN')
+            details_str = action
+            if res.get('target'):
+                details_str += f" (target: {res.get('target')}"
+                if res.get('text'):
+                    details_str += f", text: {res.get('text')}"
+                if res.get('color'):
+                    details_str += f", color: {res.get('color')}"
+                details_str += ")"
+            return jsonify({"status": "ok", "message": f"Executed {details_str}", "details": res})
         return jsonify({"status": "ok", "message": "Voice phrase logged (Engine Standby)"})
 
     return app

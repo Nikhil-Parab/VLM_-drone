@@ -75,10 +75,11 @@ class CommandParser:
         if self.vlm_engine is not None:
             logger.info(f"[CommandParser] Routing to SmolVLM: '{raw_text}'")
             cmd = self.vlm_engine.parse_command(raw_text)
-            cmd["source"] = cmd.get("source", "smolvlm")
-            if is_voice:
-                cmd["source"] += "_voice"
-            return cmd
+            if cmd and cmd.get("action") and cmd.get("action") != "UNKNOWN":
+                cmd["source"] = cmd.get("source", "smolvlm")
+                if is_voice:
+                    cmd["source"] += "_voice"
+                return cmd
 
         # ------------------------------------------------------------------ #
         # Fallback — original regex SEARCH/TRACK parsing                      #
