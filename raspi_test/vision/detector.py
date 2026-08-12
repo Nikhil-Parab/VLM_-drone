@@ -137,14 +137,17 @@ class ObjectDetector:
                 else:
                     ocr_match = False
 
-            is_locked_target = has_specific_descriptor and color_match and ocr_match
+            if has_specific_descriptor:
+                is_locked_target = color_match and ocr_match
+            else:
+                is_locked_target = True
 
             d["is_target"] = is_locked_target
             if is_locked_target:
                 tag_parts = []
                 if color_filter: tag_parts.append(str(color_filter).upper())
                 if text_filter: tag_parts.append(f"[{str(text_filter).upper()}]")
-                d["label"] = f"LOCKED {d['label']} {' '.join(tag_parts)}".strip()
+                d["label"] = f"{d['label']} {' '.join(tag_parts)}".strip()
 
             results.append(d)
 

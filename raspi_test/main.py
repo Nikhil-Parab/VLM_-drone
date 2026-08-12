@@ -203,14 +203,13 @@ class MissionEngine:
                 cx, cy = obj.center
 
 
-                is_explicit_locked = getattr(obj, "is_target", False) or (self.active_track_id is not None and self.active_track_id == obj.track_id)
+                matches_search = (self.mode in ["SEARCH", "TRACK"] and self.search_target and (self.search_target in obj.label.lower() or obj.label.lower() in self.search_target))
+                is_explicit_locked = getattr(obj, "is_target", False) or (self.active_track_id is not None and self.active_track_id == obj.track_id) or matches_search
 
                 if is_explicit_locked:
-
                     color = (0, 0, 255)
                     cv2.rectangle(processed_frame, (x, y), (x + bw, y + bh), color, 2)
                     self._draw_hud_corners(processed_frame, x, y, bw, bh, color, length=16, thickness=3)
-
 
                     cv2.circle(processed_frame, (cx, cy), 5, (0, 0, 255), -1)
                     cv2.drawMarker(processed_frame, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 14, 2)
@@ -221,7 +220,6 @@ class MissionEngine:
                     cv2.putText(processed_frame, label_str, (x + 3, max(th + 3, y - 4)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
                 else:
-
                     color = (0, 255, 0)
                     cv2.rectangle(processed_frame, (x, y), (x + bw, y + bh), color, 1)
                     label_str = f"#{obj.track_id} {obj.label} ({obj.confidence:.2f})"
@@ -234,7 +232,7 @@ class MissionEngine:
             )
 
 
-            if active_obj and (getattr(active_obj, "is_target", False) or self.active_track_id is not None):
+            if active_obj and (getattr(active_obj, "is_target", False) or self.active_track_id is not None or (self.mode in ["SEARCH", "TRACK"] and self.search_target)):
                 cv2.line(processed_frame, (w // 2, h // 2), active_obj.center, (0, 255, 255), 2)
                 cv2.circle(processed_frame, (w // 2, h // 2), 4, (0, 240, 255), -1)
 
