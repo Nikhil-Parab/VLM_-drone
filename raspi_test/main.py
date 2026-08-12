@@ -12,7 +12,7 @@ if script_dir not in sys.path:
 
 user_site = os.path.expanduser("~/.local/lib/python3.13/site-packages")
 if user_site not in sys.path and os.path.exists(user_site):
-    sys.path.insert(0, user_site)
+    sys.path.append(user_site)
 
 import time
 import threading
