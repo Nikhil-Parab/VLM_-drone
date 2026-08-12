@@ -1,0 +1,16 @@
+# Core DroneEye dependencies
+flask
+opencv-python
+numpy
+onnxruntime
+pymavlink
+psutil
+
+# SmolVLM Natural Language Command Engine dependencies
+transformers
+torch
+accelerate
+
+# Optional voice recognition dependencies
+SpeechRecognition
+pyaudio
