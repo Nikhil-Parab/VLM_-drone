@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hexacopter Ground Control Station - RPi 5</title>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0a0e17;
+            --panel-bg: rgba(16, 24, 40, 0.85);
+            --accent-cyan: #00f0ff;
+            --accent-green: #00ff88;
+            --accent-red: #ff3366;
+            --accent-orange: #ffaa00;
+            --text-main: #e2e8f0;
+            --text-dim: #94a3b8;
+            --border-glow: rgba(0, 240, 255, 0.25);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        header {
+            background: linear-gradient(90deg, #0d1527, #132238);
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-glow);
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .brand h1 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.3rem;
+            color: var(--accent-cyan);
+            letter-spacing: 1.5px;
+        }
+
+        .status-pill {
+            background: rgba(0, 255, 136, 0.15);
+            color: var(--accent-green);
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            border: 1px solid var(--accent-green);
+        }
+
+        .main-container {
+            display: grid;
+            grid-template-columns: 1fr 360px;
+            gap: 16px;
+            padding: 16px;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .video-container {
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid rgba(0, 240, 255, 0.3);
+            box-shadow: 0 0 20px rgba(0, 240, 255, 0.1);
+        }
+
+        .video-feed {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .overlay-hud {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .hud-badge {
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(8px);
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            border-left: 3px solid var(--accent-cyan);
+        }
+
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            overflow-y: auto;
+        }
+
+        .panel {
+            background: var(--panel-bg);
+            backdrop-filter: blur(12px);
+            border-radius: 12px;
+            padding: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .panel-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.85rem;
+            color: var(--accent-cyan);
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .telemetry-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .metric-card {
+            background: rgba(255, 255, 255, 0.03);
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .metric-label {
+            font-size: 0.7rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+        }
+
+        .metric-val {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.05rem;
+            color: var(--text-main);
+            margin-top: 3px;
+        }
+
+        .progress-bar-bg {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            height: 6px;
+            width: 100%;
+            margin-top: 5px;
+            overflow: hidden;
+        }
+
+        .progress-bar-fill {
+            background: var(--accent-cyan);
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .cmd-input-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        input[type="text"], select {
+            flex: 1;
+            background: rgba(0, 0, 0, 0.6);
+            border: 1px solid rgba(0, 240, 255, 0.3);
+            border-radius: 6px;
+            padding: 8px 10px;
+            color: #fff;
+            font-size: 0.8rem;
+            outline: none;
+        }
+
+        input[type="text"]:focus, select:focus {
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 8px rgba(0, 240, 255, 0.3);
+        }
+
+        button {
+            background: linear-gradient(135deg, var(--accent-cyan), #0099ff);
+            color: #000;
+            font-weight: 700;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s ease;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 240, 255, 0.4);
+        }
+
+        .btn-red {
+            background: linear-gradient(135deg, var(--accent-red), #cc0033);
+            color: #fff;
+        }
+
+        .btn-green {
+            background: linear-gradient(135deg, var(--accent-green), #00cc66);
+            color: #000;
+        }
+
+        .btn-orange {
+            background: linear-gradient(135deg, var(--accent-orange), #cc8800);
+            color: #000;
+        }
+
+        .quality-btn-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 6px;
+            margin-top: 6px;
+        }
+
+        .quick-actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .log-box {
+            background: rgba(0, 0, 0, 0.6);
+            border-radius: 6px;
+            padding: 8px;
+            height: 90px;
+            font-family: monospace;
+            font-size: 0.72rem;
+            overflow-y: auto;
+            color: #00ff88;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <h1>HEXACOPTER GCS</h1>
+            <span style="font-size: 0.75rem; color: var(--text-dim);">RASPBERRY PI 5 (8GB)</span>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+            <div class="status-pill" id="health-pill" style="border-color: var(--accent-green); color: var(--accent-green);">SYSTEM: HEALTHY</div>
+            <div class="status-pill" id="mode-pill">MODE: GUIDED</div>
+            <div class="status-pill" id="rc-pill" style="border-color: var(--accent-cyan); color: var(--accent-cyan);">RC: STANDBY</div>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <div class="video-container">
+            <img src="/video_feed" class="video-feed" alt="Live Stream">
+            <div class="overlay-hud">
+                <div class="hud-badge" id="hud-target">SEARCH: ANY TARGET</div>
+                <div class="hud-badge" id="hud-fps">STREAM: BALANCED</div>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            
+            <div class="panel">
+                <div class="panel-title">
+                    <span>STREAM VIDEO QUALITY</span>
+                    <span id="quality-badge" style="font-size:0.7rem; color:var(--accent-cyan);">BALANCED</span>
+                </div>
+                <div class="quality-btn-group">
+                    <button id="qbtn-low" onclick="setQuality('low')">⚡ LOW (360p)</button>
+                    <button id="qbtn-balanced" class="btn-green" onclick="setQuality('balanced')">⚙️ BALANCED</button>
+                    <button id="qbtn-hd" onclick="setQuality('hd')">🌟 HD (720p)</button>
+                </div>
+            </div>
+
+            
+            <div class="panel">
+                <div class="panel-title">
+                    <span>SYSTEM HEALTH & DIAGNOSTICS</span>
+                    <span id="health-badge" style="font-size:0.7rem; color:var(--accent-green);">RPi 5 (8GB)</span>
+                </div>
+                <div class="telemetry-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">CPU TEMP</div>
+                        <div class="metric-val" id="val-temp" style="color: var(--accent-green);">45.0°C</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">CPU LOAD</div>
+                        <div class="metric-val" id="val-cpu">15%</div>
+                        <div class="progress-bar-bg"><div class="progress-bar-fill" id="bar-cpu" style="width:15%;"></div></div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">RAM USAGE</div>
+                        <div class="metric-val" id="val-ram">1.2 GB (15%)</div>
+                        <div class="progress-bar-bg"><div class="progress-bar-fill" id="bar-ram" style="width:15%;"></div></div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">INFERENCE LATENCY</div>
+                        <div class="metric-val" id="val-latency" style="color: var(--accent-cyan);">0.0 ms</div>
+                    </div>
+                </div>
+            </div>
+
+            
+            <div class="panel">
+                <div class="panel-title">FLIGHT & MISSION TELEMETRY</div>
+                <div class="telemetry-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">ALTITUDE</div>
+                        <div class="metric-val" id="val-alt">0.0 m</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">SPEED (XY)</div>
+                        <div class="metric-val" id="val-speed">0.0 m/s</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">BATTERY</div>
+                        <div class="metric-val" id="val-bat" style="color: var(--accent-green);">100%</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">HEADING</div>
+                        <div class="metric-val" id="val-head">0.0°</div>
+                    </div>
+                </div>
+            </div>
+
+            
+            <div class="panel">
+                <div class="panel-title">MISSION PLAN & COMMAND CONSOLE</div>
+                <div class="cmd-input-group">
+                    <input type="text" id="cmd-input" placeholder="Dynamic command e.g. SEARCH bottles...">
+                    <button onclick="sendCommand()">SEND</button>
+                </div>
+                <div class="cmd-input-group">
+                    <input type="text" id="voice-input" placeholder="Voice: 'Jarvis, track person with Monday shirt'">
+                    <button class="btn-green" onclick="sendVoiceCommand()">SPEAK</button>
+                </div>
+
+                <div class="quick-actions">
+                    <button class="btn-green" onclick="execCmd('ARM')">ARM</button>
+                    <button class="btn-red" onclick="execCmd('DISARM')">DISARM</button>
+                    <button onclick="execCmd('TAKEOFF 10')">TAKEOFF 10M</button>
+                    <button class="btn-orange" onclick="execCmd('RTL')">RTL</button>
+                    <button onclick="execCmd('search bottles')">SEARCH BOTTLES</button>
+                    <button onclick="execCmd('search people')">SEARCH PEOPLE</button>
+                    <button onclick="execCmd('SCAN_GEO')">SCAN TERRAIN</button>
+                    <button onclick="execCmd('HOLD')">HOLD</button>
+                </div>
+            </div>
+
+            
+            <div class="panel">
+                <div class="panel-title">SYSTEM LOGS</div>
+                <div class="log-box" id="log-box">
+                    [SYSTEM] Hexacopter GCS Dashboard Connected.<br>
+                    [SYSTEM] Dynamic Video Quality Selector Ready.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function appendLog(msg) {
+            const box = document.getElementById("log-box");
+            box.innerHTML += `<br>[${new Date().toLocaleTimeString()}] ${msg}`;
+            box.scrollTop = box.scrollHeight;
+        }
+
+        function setQuality(qMode) {
+            appendLog(`Switching Stream Quality to: ${qMode.toUpperCase()}`);
+            fetch('/api/stream_quality', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({quality: qMode})
+            })
+            .then(res => res.json())
+            .then(data => {
+                appendLog(data.message);
+                document.getElementById("quality-badge").innerText = qMode.toUpperCase();
+                document.getElementById("hud-fps").innerText = `STREAM: ${qMode.toUpperCase()}`;
+                
+                ["low", "balanced", "hd"].forEach(m => {
+                    const btn = document.getElementById(`qbtn-${m}`);
+                    if (m === qMode) {
+                        btn.className = "btn-green";
+                    } else {
+                        btn.className = "";
+                    }
+                });
+            })
+            .catch(err => appendLog(`Error: ${err}`));
+        }
+
+        function execCmd(cmdText) {
+            document.getElementById("cmd-input").value = cmdText;
+            sendCommand();
+        }
+
+        function sendCommand() {
+            const input = document.getElementById("cmd-input");
+            const text = input.value.trim();
+            if (!text) return;
+
+            appendLog(`Sending Text Cmd: "${text}"`);
+            fetch('/api/command', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({text: text})
+            })
+            .then(res => res.json())
+            .then(data => {
+                appendLog(`Response: ${data.message}`);
+                input.value = "";
+            })
+            .catch(err => appendLog(`Error: ${err}`));
+        }
+
+        function sendVoiceCommand() {
+            const input = document.getElementById("voice-input");
+            const text = input.value.trim();
+            if (!text) return;
+
+            appendLog(`Simulated Voice: "${text}"`);
+            fetch('/api/voice_command', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({phrase: text})
+            })
+            .then(res => res.json())
+            .then(data => {
+                appendLog(`Voice Action: ${data.message}`);
+                input.value = "";
+            })
+            .catch(err => appendLog(`Error: ${err}`));
+        }
+
+        setInterval(() => {
+            fetch('/telemetry')
+            .then(res => res.json())
+            .then(data => {
+                if (data.mode) document.getElementById("mode-pill").innerText = `MODE: ${data.mode}`;
+                if (data.alt !== undefined) document.getElementById("val-alt").innerText = `${data.alt.toFixed(1)} m`;
+                if (data.speed !== undefined) document.getElementById("val-speed").innerText = `${data.speed.toFixed(1)} m/s`;
+                if (data.battery !== undefined) document.getElementById("val-bat").innerText = `${data.battery}%`;
+                if (data.heading !== undefined) document.getElementById("val-head").innerText = `${data.heading.toFixed(0)}°`;
+                if (data.search_target) document.getElementById("hud-target").innerText = `SEARCH: ${data.search_target.toUpperCase()}`;
+                
+                if (data.cpu_temp !== undefined) {
+                    const tempElem = document.getElementById("val-temp");
+                    tempElem.innerText = `${data.cpu_temp.toFixed(1)}°C`;
+                    tempElem.style.color = data.cpu_temp > 75 ? "var(--accent-red)" : (data.cpu_temp > 65 ? "var(--accent-orange)" : "var(--accent-green)");
+                }
+                if (data.cpu_usage !== undefined) {
+                    document.getElementById("val-cpu").innerText = `${data.cpu_usage.toFixed(0)}%`;
+                    document.getElementById("bar-cpu").style.width = `${data.cpu_usage}%`;
+                }
+                if (data.ram_pct !== undefined) {
+                    document.getElementById("val-ram").innerText = `${data.ram_used_mb} MB (${data.ram_pct}%)`;
+                    document.getElementById("bar-ram").style.width = `${data.ram_pct}%`;
+                }
+                if (data.inference_latency !== undefined) {
+                    document.getElementById("val-latency").innerText = `${data.inference_latency.toFixed(1)} ms`;
+                }
+                if (data.health_status) {
+                    const hPill = document.getElementById("health-pill");
+                    hPill.innerText = `SYS: ${data.health_status}`;
+                    if (data.health_color) hPill.style.color = data.health_color;
+                }
+                if (data.manual_override) {
+                    document.getElementById("rc-pill").innerText = "RC: MANUAL OVERRIDE";
+                    document.getElementById("rc-pill").style.color = "var(--accent-red)";
+                } else {
+                    document.getElementById("rc-pill").innerText = "RC: STANDBY";
+                    document.getElementById("rc-pill").style.color = "var(--accent-cyan)";
+                }
+            })
+            .catch(() => {});
+        }, 500);
+    </script>
+</body>
+</html>

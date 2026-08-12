@@ -6,6 +6,10 @@ os.environ["OMP_NUM_THREADS"] = "2"
 os.environ["MKL_NUM_THREADS"] = "2"
 os.environ["OPENBLAS_NUM_THREADS"] = "2"
 
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
 user_site = os.path.expanduser("~/.local/lib/python3.13/site-packages")
 if user_site not in sys.path and os.path.exists(user_site):
     sys.path.insert(0, user_site)
